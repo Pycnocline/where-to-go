@@ -3,9 +3,11 @@ package ui
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"image"
 	"image/color"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -172,6 +174,20 @@ func New(t *Theme, cfg Config) (*App, error) {
 		return nil, err
 	}
 
+	// 加载 data/calibration.json 覆盖 Settings.WorldUnitsPerMinimapPx。
+	// 避免用户在 -cmd test-locator 里扫出 K=0.96 但 UI 启动时仍用默认 K=0.5
+	// —— 这是"无论怎么校准 sharp 都很低"的常见原因。
+	calPath := filepath.Join(dataDir, "calibration.json")
+	if cal, ok, cerr := locator.LoadCalibration(calPath); cerr == nil && ok && cal.K > 0 {
+		cur := settings.Get().WorldUnitsPerMinimapPx
+		if math.Abs(cur-cal.K) > 1e-6 {
+			log.Printf("[calibration] 从 %s 加载 K=%.3f（原 Settings=%.3f，覆盖）", calPath, cal.K, cur)
+			settings.Update(func(s *Settings) { s.WorldUnitsPerMinimapPx = cal.K })
+		}
+	} else if cerr != nil {
+		log.Printf("[calibration] 读取 %s 失败: %v", calPath, cerr)
+	}
+
 	a := &App{
 		Theme:        t,
 		store:        store,
@@ -225,9 +241,53 @@ type navState struct {
 	velX, velY float64
 	lastFixAt  time.Time
 
+	// 速度统计：用 |velX,velY| 的 EMA 给"典型移动速度"建模，供异常移动检测用。
+	speedEMA      float64 // 平滑速度估计
+	speedEMAReady bool
+
 	// 后台多种子重定位的节流 / 防重入
 	bgRelocateRunning bool
 	bgRelocateLastAt  time.Time
+	// bgFailStreak 周期 bg 连续失败次数（coarse / verify 任一失败计一次）。
+	// 每次 runBgReLocalize 根据此值决定 coarse 搜索半径：
+	//   - 0~2 次失败：r=200（轻量）
+	//   - 3~5 次失败：r=400
+	//   - ≥6 次失败：r=600（封顶；玩家可能远离所有 seed 候选）
+	// 成功（verify sharp ≥ 0.30）时清零；让 bg 能自动从小半径开始恢复。
+	bgFailStreak int
+	// bgRelocateConfirmAt 最近一次后台重定位"高置信度确认"的墙钟时间。
+	// 被 Task 4 的异常移动拒绝逻辑用来判断："刚被 bg-relocate 认可为 (X,Y)，
+	// 所以即使主匹配给出远距离跳变也可信（传送场景）"。
+	bgRelocateConfirmAt time.Time
+	bgRelocateConfirmX  float64
+	bgRelocateConfirmY  float64
+
+	// periodicRelocateCancel 控制 10s 周期 bg 重定位 goroutine 停止。
+	periodicRelocateCancel context.CancelFunc
+
+	// snapFreezeUntil / snapFreezeX/Y 用户校准"玩家在这里"后的显示冻结期。
+	// 在此时间之前，handleNavFix 会把任何新 fix 的显示位置强制回滚到
+	// (snapFreezeX, snapFreezeY)，避免用户校准后立刻被运行期 matcher 略偏
+	// 的新结果推走造成视觉瞬移。
+	snapFreezeUntil time.Time
+	snapFreezeX     float64
+	snapFreezeY     float64
+
+	// lastFrameHash 主匹配上一帧 ROI 截图的哈希。玩家完全不动时，连续帧的
+	// minimap 截图字节级一致，hash 命中即跳过整次 EdgeMatcher.Match（节省
+	// ~100 ms/帧），直接复用 lastFrameFix。仅在上次 fix 高置信度（≥ 0.30）
+	// 时启用，避免低置信度数据被冻结放大。
+	//
+	// 任何 UI 变化（视野锥旋转、玩家箭头闪烁、弹窗叠加）都会让字节序列改变
+	// → hash 不命中 → 正常 Match → 安全。
+	lastFrameHash      uint64
+	lastFrameFix       locator.Fix
+	lastFrameHashValid bool
+
+	// lastBgFrameHash 周期 bg 重定位的 ROI 截图哈希。命中则直接 return，
+	// 不重跑多种子粗搜 + verify（节省 ~1~3 s）。
+	lastBgFrameHash      uint64
+	lastBgFrameHashValid bool
 }
 
 // snapshot 拷贝一份只读副本（含锁）。
@@ -256,6 +316,14 @@ func (s *storeLookup) WikiPointAt(worldX, worldY, worldR2 float64) (mt, id strin
 		return "", "", 0, 0, false
 	}
 	return hp.MarkType, hp.ID, hp.X, hp.Y, true
+}
+
+// imgHashFNV64 对 RGBA 的像素字节做 FNV-1a 64bit 哈希。~0.2 ms for 230×230×4。
+// 玩家完全不动时连续帧字节级一致，hash 命中 → 跳过 Match / bg 全流程。
+func imgHashFNV64(img *image.RGBA) uint64 {
+	h := fnv.New64a()
+	h.Write(img.Pix)
+	return h.Sum64()
 }
 
 // LockFrame / UnlockFrame 供悬浮窗协程"在渲染时避开主窗口"用。
@@ -690,11 +758,15 @@ func (a *App) StartTracking() {
 	}()
 }
 
-// startMatcherLoopAsync 在后台线程做广域校准 + 启动匹配 loop；被 StartTracking /
+// startMatcherLoopAsync 在后台线程做首帧定位 + 启动匹配 loop；被 StartTracking /
 // StartNavigation 共同使用。routeID="" 且 p=nil 表示纯追踪；否则是导航。
 //
-// 关键：广域 NCC 失败 *不* 再终止流程。无论是否找到高分位置，都会启动 loop，
-// 由 Match + patch-vote 接力，并在后台继续重定位。
+// 关键：首帧定位用 EdgeMatcher.MatchMultiSeed（和运行期一致的匹配管线），
+// 门槛 sharp ≥ 0.30。未达标 *不* 采信结果（不写 nav.fix），直接以旧 seed
+// 启动 loop，由运行期 + 6s 周期 bg 重定位兜底。
+//
+// 旧实现用 NCC Matcher 在启动期广域扫描，门槛低（0.35/0.40），常在纯色区域
+// 误命中假峰，把玩家定到海面 / 草地上，后续 EdgeMatcher 从错位开始再也回不来。
 func (a *App) startMatcherLoopAsync(cfg Settings, img *image.RGBA, seedX, seedY float64, roi locator.ROI, routeID string, p *mapdata.Path) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -710,62 +782,46 @@ func (a *App) startMatcherLoopAsync(cfg Settings, img *image.RGBA, seedX, seedY 
 	if zoom <= 0 {
 		zoom = 8
 	}
-	wm := &locator.Matcher{
-		Mosaic:                 mosaic,
-		WorldUnitsPerMinimapPx: cfg.WorldUnitsPerMinimapPx,
-		SearchZoom:             zoom,
-		HeadingDetect:          false,
-		ScaleRatios:            []float64{0.4, 0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5},
-		SearchRadiusPx:         200,
-		WikiHalfCap:            1500,
-		DebugLog:               cfg.DebugLog,
-	}
-	wm.SetSeed(seedX, seedY)
-	firstFix, _ := wm.Match(img)
-	dbg := wm.LastDebug
 
-	// 第一帧广域 NCC 失败 → 立刻多种子搜索（修复"重启 / 传送"场景）
-	gotWide := dbg.BestScore >= 0.35
-	if !gotWide {
-		seeds := a.collectReLocalizeSeeds()
-		// 把即将用的 seed 作为优先候选
-		seeds = append([]locator.Fix{{WorldX: seedX, WorldY: seedY}}, seeds...)
-		// 如果是导航，把路径节点也加入候选
-		if p != nil {
-			for i := 0; i < len(p.Nodes); i += len(p.Nodes)/8 + 1 {
-				seeds = append(seeds, locator.Fix{WorldX: p.Nodes[i].X, WorldY: p.Nodes[i].Y})
-			}
-			seeds = append(seeds, locator.Fix{WorldX: p.Nodes[len(p.Nodes)-1].X, WorldY: p.Nodes[len(p.Nodes)-1].Y})
+	// 组装候选 seeds：提供的 seed 优先，然后 collectReLocalizeSeeds，然后路径节点
+	seeds := []locator.Fix{{WorldX: seedX, WorldY: seedY}}
+	seeds = append(seeds, a.collectReLocalizeSeeds()...)
+	if p != nil {
+		for i := 0; i < len(p.Nodes); i += len(p.Nodes)/8 + 1 {
+			seeds = append(seeds, locator.Fix{WorldX: p.Nodes[i].X, WorldY: p.Nodes[i].Y})
 		}
-		log.Printf("[start] first wide-scale low (%.2f); trying %d-seed search", dbg.BestScore, len(seeds))
-		multiBest, _, mErr := wm.MatchMultiSeed(img, seeds, 200, 1500)
-		if mErr == nil && multiBest.Confidence >= 0.40 {
-			firstFix = multiBest
-			dbg.BestScore = multiBest.Confidence
-			dbg.BestScale = wm.LastDebug.BestScale
-			gotWide = true
-			log.Printf("[start] multi-seed found NCC=%.2f at (%.0f, %.0f)",
-				multiBest.Confidence, multiBest.WorldX, multiBest.WorldY)
-		} else {
-			log.Printf("[start] multi-seed also failed (best=%.2f, err=%v)",
-				multiBest.Confidence, mErr)
-		}
+		seeds = append(seeds, locator.Fix{WorldX: p.Nodes[len(p.Nodes)-1].X, WorldY: p.Nodes[len(p.Nodes)-1].Y})
 	}
 
-	if gotWide {
-		effectiveK := cfg.WorldUnitsPerMinimapPx * dbg.BestScale
-		if effectiveK >= 0.1 && effectiveK <= 5.0 {
-			cfg.WorldUnitsPerMinimapPx = effectiveK
-		}
+	em := locator.NewEdgeMatcher(mosaic, cfg.WorldUnitsPerMinimapPx)
+	em.SearchZoom = zoom
+	em.SearchRadiusMinPx = 200
+	em.SearchRadiusMaxPx = 200
+	em.MinSharpness = -1
+	em.HeadingDetect = false
+	em.DebugLog = cfg.DebugLog
+	em.Downsample = 2          // 降采样粗搜，~16× 加速
+	em.EarlyStopSharp = 0.55   // 找到很高信心立即停
+	t0 := time.Now()
+	firstFix, allSharp, mErr := em.MatchMultiSeed(img, seeds)
+	log.Printf("[start] edge multi-seed: sharp=%.3f at (%.0f, %.0f) took %v; all=%v; err=%v",
+		firstFix.Confidence, firstFix.WorldX, firstFix.WorldY, time.Since(t0).Round(time.Millisecond), allSharp, mErr)
+
+	gotFirst := mErr == nil && firstFix.Confidence >= 0.30
+	if gotFirst {
 		seedX, seedY = firstFix.WorldX, firstFix.WorldY
 		a.nav.mu.Lock()
 		a.nav.fix = firstFix
 		a.nav.fix.HasHeading = false
 		a.nav.hasFix = true
 		a.nav.lost = false
+		// 记为"刚被 bg 确认"，让 plausibility 在启动后的头 12s 不做误拒
+		a.nav.bgRelocateConfirmAt = time.Now()
+		a.nav.bgRelocateConfirmX = firstFix.WorldX
+		a.nav.bgRelocateConfirmY = firstFix.WorldY
 		a.nav.mu.Unlock()
 	} else {
-		log.Printf("[start] wide-scale low; starting loop with persisted seed/K anyway")
+		log.Printf("[start] first-frame sharp low (< 0.30); starting loop with persisted seed, bg will relocalize")
 		a.nav.mu.Lock()
 		a.nav.fix = locator.Fix{WorldX: seedX, WorldY: seedY, Confidence: 0}
 		a.nav.hasFix = false
@@ -799,10 +855,22 @@ func (a *App) startMatcherLoopAsync(cfg Settings, img *image.RGBA, seedX, seedY 
 		a.nav.loc = nil
 		go old.Stop()
 	}
+	if a.nav.periodicRelocateCancel != nil {
+		a.nav.periodicRelocateCancel()
+		a.nav.periodicRelocateCancel = nil
+	}
 	a.nav.active = true
 	a.nav.routeID = routeID
 	a.nav.loc = loc
 	a.nav.startedAt = time.Now()
+	// 新 session 清理：上一次会话的 progress / bgFailStreak / 截图哈希都可能和
+	// 新路径 / 新位置不兼容。
+	a.nav.progress = NavProgress{}
+	a.nav.bgFailStreak = 0
+	a.nav.lastFrameHashValid = false
+	a.nav.lastBgFrameHashValid = false
+	pCtx, pCancel := context.WithCancel(context.Background())
+	a.nav.periodicRelocateCancel = pCancel
 	a.nav.mu.Unlock()
 	if err := loc.Start(); err != nil {
 		a.hint = "启动失败：" + err.Error()
@@ -810,12 +878,19 @@ func (a *App) startMatcherLoopAsync(cfg Settings, img *image.RGBA, seedX, seedY 
 		a.nav.active = false
 		a.nav.loc = nil
 		a.nav.hasFix = false
+		a.nav.progress = NavProgress{}
+		a.nav.bgFailStreak = 0
+		if a.nav.periodicRelocateCancel != nil {
+			a.nav.periodicRelocateCancel()
+			a.nav.periodicRelocateCancel = nil
+		}
 		a.nav.mu.Unlock()
 		if a.Window != nil {
 			a.Window.Invalidate()
 		}
 		return
 	}
+	go a.runPeriodicRelocate(pCtx)
 	label := "追踪"
 	if routeID != "" {
 		label = "导航"
@@ -823,27 +898,39 @@ func (a *App) startMatcherLoopAsync(cfg Settings, img *image.RGBA, seedX, seedY 
 			label = "导航：" + p.Name
 		}
 	}
-	if gotWide {
-		a.hint = fmt.Sprintf("已开始%s (NCC=%.2f, scale=%.2f, K=%.3f)",
-			label, dbg.BestScore, dbg.BestScale, cfg.WorldUnitsPerMinimapPx)
+	if gotFirst {
+		a.hint = fmt.Sprintf("已开始%s（sharp=%.2f at (%.0f,%.0f)，K=%.3f）",
+			label, firstFix.Confidence, firstFix.WorldX, firstFix.WorldY, cfg.WorldUnitsPerMinimapPx)
 	} else {
-		a.hint = fmt.Sprintf("已启动%s loop（首帧广域 NCC=%.2f 低；定位稳定前请右键校准）",
-			label, dbg.BestScore)
+		a.hint = fmt.Sprintf("已启动%s loop（首帧 sharp=%.2f 低；等待后台重定位或手动校准）",
+			label, firstFix.Confidence)
 	}
 	if a.Window != nil {
 		a.Window.Invalidate()
 	}
 }
 
-// buildRealMatcher 根据当前 settings 与种子坐标构造真实 NCC matcher，包装一个会更新种子的 MatchFn。
+// buildRealMatcher 构造导航期使用的匹配器。
 //
-// 关键策略（修复定位偏移 / patch-vote 永久错误）：
-//  1. 主 Match 命中 (conf >= 0.55)：UpdateSeed，正常前进。
-//  2. 主 Match 中等命中 (0.30 ≤ conf < 0.55)：UpdateSeed，正常前进；patch-vote 不动。
-//  3. 主 Match 低分 / 错误：尝试 patch-vote。命中视为 *临时* (Tentative=true)：
-//     - 返回给 UI 让用户感知，但 *不* 写入 m.LastFix（下一帧仍从老 seed 出发匹配）
-//     - 不持久化到 LastPlayer
-//     - 触发后台多种子全图重定位（debounced 在 App 侧）
+// 实现：使用 EdgeMatcher（基于 Sobel 边缘 + 掩码 SSD + 尖锐度置信度）。
+//
+// 两档处理：
+//   - sharp ≥ 0.30：高信心，UpdateSeed，正常返回 → OnFix → handleNavFix
+//   - sharp <  0.30：低信心，标 Tentative 并返回 err → 走 OnErr → applyNavFallback，
+//                    不写入 nav.fix，不污染 speedEMA / LastPlayer。
+//
+// 职责分工（修复"追踪几十秒无反应"的 regression）：
+//   - **主匹配**：小半径（60~200）快速跟踪，单次 Match ~100ms，跟得上 400ms loop
+//   - **bg 兜底**：navState.bgFailStreak 自适应扩到 600，6s 周期，独立 goroutine
+//
+// 此前错误尝试 MinSharpness=0.30 启用 EdgeMatcher 内部自适应半径 —— 它会在
+// 连续失败时把 radius 扩到 MaxPx=600，导致单次 Match 耗时 1~2s，主匹配 loop
+// 完全堵塞。大半径搜索应该由 bg goroutine 独立承担，不应挤占主匹配资源。
+//
+// at-boundary 修复仍保留：EdgeMatcher.Match 里 sharp≥MinSharpness 但命中边界
+// 时返回 nil err（原来返回 err 导致 wrapper 丢弃，玩家高速移动时卡住）。
+//
+// 日志节流到每 10 秒一条。
 func (a *App) buildRealMatcher(cfg Settings, seedX, seedY float64) locator.MatchFn {
 	layer := locatorLayerOf(a.store, a.mapView.Layer())
 	mosaic := &locator.MosaicProvider{Cache: a.cache, Layer: layer}
@@ -851,49 +938,56 @@ func (a *App) buildRealMatcher(cfg Settings, seedX, seedY float64) locator.Match
 	if searchZoom <= 0 {
 		searchZoom = 8
 	}
-	m := &locator.Matcher{
-		Mosaic:                 mosaic,
-		WorldUnitsPerMinimapPx: cfg.WorldUnitsPerMinimapPx,
-		SearchZoom:             searchZoom,
-		HeadingDetect:          true,
-		ScaleRatios:            []float64{0.5, 0.7, 1.0, 1.4, 2.0},
-		SearchRadiusPx:         48,
-		WikiHalfCap:            1500, // 提升上限，允许失败累积时把 radius 放大也能渲染对应 wiki 区域
-		DebugLog:               cfg.DebugLog,
-	}
+	m := locator.NewEdgeMatcher(mosaic, cfg.WorldUnitsPerMinimapPx)
+	m.SearchZoom = searchZoom
+	m.SearchRadiusMinPx = 60
+	m.SearchRadiusMaxPx = 200 // 主匹配上限；更大的搜索由 bg 承担
+	m.MinSharpness = -1       // wrapper 自判 sharp。启用 0.30 会让 radius 扩到 MaxPx 拖慢主 loop
+	m.HeadingDetect = true
+	m.DebugLog = cfg.DebugLog
 	m.SetSeed(seedX, seedY)
+	var lastLowLogAt time.Time
+	var lowCount int
 	return func(roi *image.RGBA) (locator.Fix, error) {
+		// 截图哈希跳过：玩家完全不动时 minimap 字节级一致 → 直接复用上次
+		// 高置信度 fix，跳过 Match（~100 ms → ~0.2 ms）。任何 UI 或玩家
+		// 变化（视野锥旋转 / 箭头闪烁）都会让 hash 变，安全。
+		h := imgHashFNV64(roi)
+		a.nav.mu.Lock()
+		if a.nav.lastFrameHashValid && a.nav.lastFrameHash == h && a.nav.lastFrameFix.Confidence >= 0.30 {
+			cached := a.nav.lastFrameFix
+			a.nav.mu.Unlock()
+			return cached, nil
+		}
+		a.nav.mu.Unlock()
+
 		f, err := m.Match(roi)
-		if err == nil && f.Confidence >= 0.55 {
+		sharp := m.LastDebug.Sharpness
+		if err == nil && sharp >= 0.30 {
 			m.UpdateSeed(f)
+			lowCount = 0
+			a.nav.mu.Lock()
+			a.nav.lastFrameHash = h
+			a.nav.lastFrameFix = f
+			a.nav.lastFrameHashValid = true
+			a.nav.mu.Unlock()
 			return f, nil
 		}
-		if err == nil && f.Confidence >= 0.30 {
-			// 中等置信度：仍然用主匹配，UpdateSeed
-			m.UpdateSeed(f)
-			return f, nil
-		}
-		// 主匹配失败或置信度低：用 patch-vote 备用算法。
-		// 仅在主匹配选出的最佳 scale 上跑，省时间。
-		bestScale := m.LastDebug.BestScale
-		if bestScale <= 0 {
-			bestScale = 1.0
-		}
-		pf, perr := m.MatchPatchVote(roi, []float64{bestScale})
-		if cfg.DebugLog {
-			log.Printf("[patch-vote] main NCC=%.2f err=%v → vote conf=%.2f err=%v",
-				f.Confidence, err, pf.Confidence, perr)
-		}
-		if perr == nil && pf.Confidence >= 0.35 {
-			pf.Tentative = true // 临时位置；UI 显示但不持久；触发 bg 重定位
-			// 关键：不调用 m.UpdateSeed(pf)。下一帧仍用旧 seed 跑主 Match，
-			// 一旦在 bg 重定位中找到真位置再被替换。
-			a.requestBgReLocalize("patch-vote tentative")
-			return pf, nil
+		// 低尖锐度或 err：nav.fix 不被覆盖；bg 6s 周期 + applyNavFallback 触发
+		// 的 requestBgReLocalize 会兜底。
+		// hash 缓存不更新（只缓存高置信度成功），保持上次的 cached fix 可用 —
+		// 下一帧如果玩家静止 + minimap 相同仍然可跳过到上次成功那帧。
+		lowCount++
+		if cfg.DebugLog && time.Since(lastLowLogAt) > 10*time.Second {
+			log.Printf("[edge-matcher] 连续 %d 帧 sharp<0.30（last sharp=%.3f err=%v）；等待 bg 兜底",
+				lowCount, sharp, err)
+			lastLowLogAt = time.Now()
+			lowCount = 0
 		}
 		if err == nil {
-			m.UpdateSeed(f)
+			err = fmt.Errorf("edge: sharp %.2f < 0.30", sharp)
 		}
+		f.Tentative = true
 		return f, err
 	}
 }
@@ -1009,8 +1103,21 @@ func (a *App) AutoCalibrateK() string {
 		newK, dbg.BestScore, dbg.BestScale, fix.WorldX, fix.WorldY)
 }
 
-// CalibrateAtWorld 用用户在地图上右键的世界坐标作为玩家真实位置 seed 校准 K，
-// 同时把追踪器的种子和显示的玩家位置都强制对齐到这个点，让校准立刻生效。
+// CalibrateAtWorld 用用户在地图上右键的世界坐标作为玩家真实位置，同时：
+//  1. 以 (wx, wy) 为真值在 K ∈ [0.50, 1.00] step 0.02 扫一遍，找出尖锐度最高的 K
+//  2. 如果扫出的 K 显著优于当前 K（或者当前 K 下 sharp < 0.30），写回 Settings
+//     并持久化到 data/calibration.json（供下次启动自动加载）
+//  3. 把玩家位置锁到 (wx, wy)，启动 3 秒显示冻结 + 12 秒 bgRelocateConfirm 窗口
+//  4. 如果追踪在跑，用新 K / 新 seed 重建 matcher 并热替换
+//
+// 为什么要扫 K：
+//   这游戏的正确 K ≈ 0.96（minimap 缩放 ≈ wiki z=7.3），但 Settings 默认值是 0.5。
+//   如果用户没跑过 -cmd test-locator（或跑了但没被应用加载），运行期就用 K=0.5，
+//   此时即使玩家位置完全正确，sharp 也只有 0.03~0.15 —— 这是"无论怎么校准 sharp
+//   都 < 0.1"的真正原因（算法本身没问题，K 一错全错）。
+//
+//   既然用户已经声明了 (wx, wy) 是真值，这就是最理想的 K 校准时机 —— 有真值，
+//   扫一遍 K 选 sharp 最高的就是正确 K。
 func (a *App) CalibrateAtWorld(wx, wy float64) string {
 	cfg := a.settings.Get()
 	if cfg.MinimapROI.Empty() {
@@ -1030,65 +1137,107 @@ func (a *App) CalibrateAtWorld(wx, wy float64) string {
 	if zoom <= 0 {
 		zoom = 8
 	}
-	// 用户右键 = "玩家就在这里" 是 ground truth。匹配器只用来扫尺度找最佳 K，
-	// 不允许它把"位置"挪走（最终 fix 强制用 (wx, wy)）。给 48 模板像素搜索半径
-	// 容忍用户点击微小偏差，但不至于跨越大片相似地形。
-	m := &locator.Matcher{
-		Mosaic:                 mosaic,
-		WorldUnitsPerMinimapPx: cfg.WorldUnitsPerMinimapPx,
-		SearchZoom:             zoom,
-		HeadingDetect:          false,
-		ScaleRatios:            []float64{0.4, 0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5},
-		SearchRadiusPx:         48,
-		WikiHalfCap:            1500,
-		DebugLog:               true,
+
+	// 步骤 1：当前 K 快速评估
+	probe := func(k float64) float64 {
+		em := locator.NewEdgeMatcher(mosaic, k)
+		em.SearchZoom = zoom
+		em.SearchRadiusMinPx = 60
+		em.SearchRadiusMaxPx = 60
+		em.MinSharpness = -1
+		em.HeadingDetect = false
+		em.AllowMissingCircle = true
+		em.SetSeed(wx, wy)
+		_, _ = em.Match(img)
+		return em.LastDebug.Sharpness
 	}
-	m.SetSeed(wx, wy)
-	_, _ = m.Match(img)
-	dbg := m.LastDebug
+	curK := cfg.WorldUnitsPerMinimapPx
+	curSharp := probe(curK)
+	log.Printf("[calibrate-here] 当前 K=%.3f at (%.0f,%.0f) sharp=%.3f", curK, wx, wy, curSharp)
 
-	if dbg.BestScore < 0.30 {
-		return fmt.Sprintf("校准 NCC 太低 (%.2f)。请确认：1) 右键的位置确实是玩家所在；2) 图层正确（当前 %s）；3) ROI 框的是游戏小地图圆形本体。全 scale 得分=%v",
-			dbg.BestScore, a.mapView.Layer(), dbg.AllScores)
+	bestK := curK
+	bestSharp := curSharp
+	scanned := false
+
+	// 步骤 2：当前 K 明显不够好 → 扫 K 找正确值
+	if curSharp < 0.30 {
+		scanned = true
+		log.Printf("[calibrate-here] 当前 K 下 sharp 偏低，扫 K ∈ [0.50, 1.00] step 0.02…")
+		cal, cerr := locator.CalibrateK(mosaic, img, wx, wy, 0.50, 1.00, 0.02, zoom, 60, func(k, s float64) {
+			if cfg.DebugLog {
+				log.Printf("    K=%.2f sharp=%.3f", k, s)
+			}
+		})
+		if cerr != nil {
+			log.Printf("[calibrate-here] 扫 K 失败: %v", cerr)
+		} else {
+			log.Printf("[calibrate-here] 扫 K 最佳：K=%.3f sharp=%.3f (当前 K=%.3f sharp=%.3f)",
+				cal.K, cal.BestSharpness, curK, curSharp)
+			if cal.BestSharpness > bestSharp+0.05 {
+				bestK = cal.K
+				bestSharp = cal.BestSharpness
+			}
+		}
 	}
 
-	newK := cfg.WorldUnitsPerMinimapPx * dbg.BestScale
-	// 夹到合理区间防止灾难性写入
-	if newK < 0.1 || newK > 5.0 {
-		return fmt.Sprintf("校准失败：算出 K=%.3f 不合理（应在 [0.1, 5.0]）。可能 NCC 在错误的尺度上偶然过阈值。建议先在游戏内把 minimap 放到最大 zoom，再校准。", newK)
-	}
-
-	// 1) 写回 K
-	a.settings.Update(func(s *Settings) {
-		s.WorldUnitsPerMinimapPx = newK
-		s.LastPlayerX = wx
-		s.LastPlayerY = wy
-		s.LastPlayerSet = true
-	})
-	_ = a.settingsView // UI editor 不再从这里同步，避免非 UI 线程访问
-
-	// 2) 强制把显示的玩家位置设为用户点的坐标 —— 这是用户给我们的 ground truth，
-	// 不应被追踪器最近的（可能错误的）匹配覆盖。
+	// 步骤 3：无条件锁定用户位置
 	a.nav.mu.Lock()
 	a.nav.fix.WorldX = wx
 	a.nav.fix.WorldY = wy
-	a.nav.fix.Confidence = dbg.BestScore
+	a.nav.fix.Confidence = bestSharp
 	a.nav.hasFix = true
 	a.nav.lost = false
+	a.nav.bgRelocateConfirmAt = time.Now()
+	a.nav.bgRelocateConfirmX = wx
+	a.nav.bgRelocateConfirmY = wy
+	a.nav.bgFailStreak = 0 // 用户手动校准了正确位置 → 让 bg 从小半径重新开始
+	// 清空截图哈希：位置被强制改到 (wx, wy)，旧 hash 对应的 fix 已失效
+	a.nav.lastFrameHashValid = false
+	a.nav.lastBgFrameHashValid = false
+	// 路径进度重置：用户可能跳到路径任意段位置，旧的 LockedSegmentIndex 会
+	// 让 ProjectOnPathLocked 在错段开始；清零后 handleNavFix 下一帧走"首次
+	// 全局投影"分支，按 (wx, wy) 真实最近段重新初始化锁。
+	a.nav.progress = NavProgress{}
+	a.nav.snapFreezeUntil = time.Now().Add(3 * time.Second)
+	a.nav.snapFreezeX = wx
+	a.nav.snapFreezeY = wy
 	tracking := a.nav.active
 	loc := a.nav.loc
 	a.nav.mu.Unlock()
 
-	// 让 mapView 的平滑插值瞬间跳到新位置（不要慢慢漂过去）
+	// 步骤 4：写回 K + LastPlayer，持久化 K 到 data/calibration.json
+	kChanged := math.Abs(bestK-curK) > 1e-6
+	a.settings.Update(func(s *Settings) {
+		s.LastPlayerX = wx
+		s.LastPlayerY = wy
+		s.LastPlayerSet = true
+		if kChanged {
+			s.WorldUnitsPerMinimapPx = bestK
+		}
+	})
+	if kChanged {
+		calPath := filepath.Join(a.dataDir, "calibration.json")
+		if werr := locator.SaveCalibration(calPath, locator.CalibrationResult{
+			K:             bestK,
+			BestSharpness: bestSharp,
+			WorldX:        wx,
+			WorldY:        wy,
+			ZoomUsed:      zoom,
+		}); werr != nil {
+			log.Printf("[calibrate-here] 保存 calibration.json 失败: %v", werr)
+		} else {
+			log.Printf("[calibrate-here] 已保存 K=%.3f 到 %s", bestK, calPath)
+		}
+	}
+
 	if a.mapView != nil {
 		a.mapView.SnapPlayerTo(wx, wy)
 	}
 
-	// 3) 如果追踪正在跑，用新 seed + 新 K 重建 matcher 并热替换。
-	// 否则下一次匹配还会带着旧 seed/K，立刻把校准结果覆盖回错误状态。
+	// 步骤 5：追踪在跑 → 用最新 K + 新 seed 重建 matcher
 	if tracking && loc != nil {
-		cfg2 := a.settings.Get() // 拿最新 K
-		newMatch := a.buildRealMatcher(cfg2, wx, wy)
+		cfgNow := a.settings.Get()
+		newMatch := a.buildRealMatcher(cfgNow, wx, wy)
 		loc.SetMatch(newMatch)
 	}
 
@@ -1096,23 +1245,53 @@ func (a *App) CalibrateAtWorld(wx, wy float64) string {
 		a.Window.Invalidate()
 	}
 
-	return fmt.Sprintf("校准成功：K=%.3f (NCC=%.2f, scale=%.2f)；玩家位置已锁定到 (%.0f, %.0f)",
-		newK, dbg.BestScore, dbg.BestScale, wx, wy)
+	// 步骤 6：分档返回 hint
+	switch {
+	case kChanged && bestSharp >= 0.30:
+		return fmt.Sprintf("校准成功：K 从 %.3f 修正为 %.3f（sharp %.2f → %.2f），位置锁到 (%.0f, %.0f)。"+
+			"已保存，下次启动自动加载。",
+			curK, bestK, curSharp, bestSharp, wx, wy)
+	case kChanged:
+		return fmt.Sprintf("K 已修正为 %.3f（sharp %.2f → %.2f，仍偏低），位置锁到 (%.0f, %.0f)。"+
+			"弱特征区追踪靠后台重定位兜底。",
+			bestK, curSharp, bestSharp, wx, wy)
+	case scanned && bestSharp < 0.10:
+		return fmt.Sprintf("位置已锁到 (%.0f, %.0f)，但扫 K 未找到更好的解（最佳 sharp=%.2f）。"+
+			"可能原因：1) ROI 没框对小地图圆形本体；2) 图层错（当前 %s，换地表/地下试试）；"+
+			"3) 点击位置与玩家实际相差 > 60 世界单位。K 保持 %.3f。",
+			wx, wy, bestSharp, a.mapView.Layer(), curK)
+	case bestSharp >= 0.30:
+		return fmt.Sprintf("校准成功（当前 K=%.3f 正确）：sharp=%.2f at (%.0f, %.0f)",
+			curK, bestSharp, wx, wy)
+	default:
+		return fmt.Sprintf("位置已锁到 (%.0f, %.0f)，sharp=%.2f（弱特征区，追踪靠后台重定位）。K=%.3f",
+			wx, wy, bestSharp, curK)
+	}
 }
 
-// requestBgReLocalize 请求一次后台多种子全图搜索；带节流（最快每 10s 一次）+
-// 互斥（同一时刻只跑一个）。被 patch-vote tentative、连续失败累积、显式 API 触发。
+// requestBgReLocalize 请求一次后台多种子全图搜索；带节流（最快每 6s 一次）+
+// 互斥（同一时刻只跑一个）。被周期 ticker / 主匹配低尖锐度 / 匹配错误触发。
 //
 // 找到高置信度位置后会更新主 matcher 的 seed 和持久化 LastPlayer。
 func (a *App) requestBgReLocalize(reason string) {
+	a.requestBgReLocalizeOpts(reason, false)
+}
+
+// requestBgReLocalizeOpts 同 requestBgReLocalize，但可选 bypassThrottle：
+// 周期 ticker 调用时 bypassThrottle=true，仅受互斥（bgRelocateRunning）约束，
+// 不受"距上次完成 ≥ 6s"节流约束 —— 否则 ticker 间隔 6s + 执行耗时 3s 的
+// 场景下，实际 cadence 会退化为 9s+。
+func (a *App) requestBgReLocalizeOpts(reason string, bypassThrottle bool) {
 	a.nav.mu.Lock()
 	if a.nav.bgRelocateRunning {
 		a.nav.mu.Unlock()
 		return
 	}
-	if !a.nav.bgRelocateLastAt.IsZero() && time.Since(a.nav.bgRelocateLastAt) < 10*time.Second {
-		a.nav.mu.Unlock()
-		return
+	if !bypassThrottle {
+		if !a.nav.bgRelocateLastAt.IsZero() && time.Since(a.nav.bgRelocateLastAt) < 6*time.Second {
+			a.nav.mu.Unlock()
+			return
+		}
 	}
 	loc := a.nav.loc
 	if !a.nav.active || loc == nil {
@@ -1125,7 +1304,19 @@ func (a *App) requestBgReLocalize(reason string) {
 	go a.runBgReLocalize(reason)
 }
 
-// runBgReLocalize 后台执行多种子搜索。完成后更新 matcher seed + LastPlayer。
+// runBgReLocalize 后台执行两段定位：
+//
+//  1. 多种子全图粗搜：用 EdgeMatcher 在每个候选 seed 位置以宽搜索半径
+//     各跑一次，取尖锐度最高者。这一步可能很慢（秒级）。
+//
+//  2. 新截图 + 小半径精确验证：粗搜返回候选位置后，重新截取当前小地图
+//     （玩家此刻的位置可能已经比粗搜起始时移动），以候选位置为 seed，
+//     在新截图上跑一次"动态半径"的 EdgeMatcher.Match。半径随粗搜耗时
+//     放大（基础 100 + 耗时 × 典型速度 × 安全系数），容忍玩家在
+//     两次截图间合理位移。
+//
+// 只有验证步骤给出 sharp ≥ 0.30 的结果才采信。否则（玩家已走出验证半径 /
+// 传送 / 粗搜本身是误命中）直接抛弃，不更新任何状态。
 func (a *App) runBgReLocalize(reason string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1142,18 +1333,28 @@ func (a *App) runBgReLocalize(reason string) {
 	}
 	roi := image.Rect(cfg.MinimapROI.X, cfg.MinimapROI.Y,
 		cfg.MinimapROI.X+cfg.MinimapROI.W, cfg.MinimapROI.Y+cfg.MinimapROI.H)
-	img, err := winutil.CaptureScreenRect(roi)
+	img1, err := winutil.CaptureScreenRect(roi)
 	if err != nil {
-		log.Printf("[bg-relocate] capture failed: %v", err)
+		log.Printf("[bg-relocate] capture1 failed: %v", err)
 		return
 	}
+
+	// 截图哈希跳过：玩家不动时 minimap 字节级一致，直接复用上次 bg 结论
+	// 跳过整个两阶段（节省 1~3 s）。仅在上次有 valid hash 时命中。
+	h1 := imgHashFNV64(img1)
+	a.nav.mu.Lock()
+	if a.nav.lastBgFrameHashValid && a.nav.lastBgFrameHash == h1 {
+		a.nav.mu.Unlock()
+		log.Printf("[bg-relocate] 截图未变 (hash=%x)，跳过（玩家静止）", h1)
+		return
+	}
+	a.nav.mu.Unlock()
 
 	seeds := a.collectReLocalizeSeeds()
 	if len(seeds) == 0 {
 		log.Printf("[bg-relocate] no seeds")
 		return
 	}
-	log.Printf("[bg-relocate] %d seeds, scanning…", len(seeds))
 
 	zoom := cfg.NavSearchZoom
 	if zoom <= 0 {
@@ -1161,25 +1362,118 @@ func (a *App) runBgReLocalize(reason string) {
 	}
 	layer := locatorLayerOf(a.store, a.mapView.Layer())
 	mosaic := &locator.MosaicProvider{Cache: a.cache, Layer: layer}
-	wm := &locator.Matcher{
-		Mosaic:                 mosaic,
-		WorldUnitsPerMinimapPx: cfg.WorldUnitsPerMinimapPx,
-		SearchZoom:             zoom,
-		HeadingDetect:          false,
-		ScaleRatios:            []float64{0.7, 1.0, 1.4},
-		DebugLog:               cfg.DebugLog,
+
+	// 阶段 1：多种子粗搜。搜索半径按连续失败次数自适应扩大：
+	//   streak 0~2：r=200（轻量，覆盖小偏移）
+	//   streak 3~5：r=400（玩家走远）
+	//   streak ≥6：r=600（完全失联，接近全图兜底）
+	// 降采样 step=2 + 早停 sharp≥0.55，速度比全分辨率快 ~16×。
+	a.nav.mu.Lock()
+	streak := a.nav.bgFailStreak
+	a.nav.mu.Unlock()
+	coarseR := 200
+	if streak >= 3 {
+		coarseR = 400
 	}
-	best, cands, mErr := wm.MatchMultiSeed(img, seeds, 200, 1500)
-	if mErr != nil {
-		log.Printf("[bg-relocate] failed: %v (top score %.2f)",
-			mErr, topScore(cands))
+	if streak >= 6 {
+		coarseR = 600
+	}
+	log.Printf("[bg-relocate] %d seeds, coarse scan (r=%d downsample=2 early-stop=0.55, streak=%d)…",
+		len(seeds), coarseR, streak)
+	t0 := time.Now()
+	em := locator.NewEdgeMatcher(mosaic, cfg.WorldUnitsPerMinimapPx)
+	em.SearchZoom = zoom
+	em.SearchRadiusMinPx = coarseR
+	em.SearchRadiusMaxPx = coarseR
+	em.MinSharpness = -1
+	em.HeadingDetect = false
+	em.DebugLog = cfg.DebugLog
+	em.Downsample = 2
+	em.EarlyStopSharp = 0.55
+	candidate, allSharp, mErr := em.MatchMultiSeed(img1, seeds)
+	coarseElapsed := time.Since(t0)
+	if mErr != nil && candidate.Confidence <= 0 {
+		log.Printf("[bg-relocate] coarse failed: %v (sharps=%v)", mErr, allSharp)
+		a.nav.mu.Lock()
+		a.nav.bgFailStreak++
+		a.nav.mu.Unlock()
 		return
 	}
-	log.Printf("[bg-relocate] best NCC=%.2f at (%.0f, %.0f)", best.Confidence, best.WorldX, best.WorldY)
-	if best.Confidence < 0.50 {
-		// 不够高，不动
+	log.Printf("[bg-relocate] coarse: sharp=%.3f at (%.0f, %.0f) took %v; tested=%d/%d sharps=%v",
+		candidate.Confidence, candidate.WorldX, candidate.WorldY,
+		coarseElapsed.Round(time.Millisecond), len(allSharp), len(seeds), allSharp)
+	if candidate.Confidence < 0.30 {
+		maxAll := 0.0
+		for _, s := range allSharp {
+			if s > maxAll {
+				maxAll = s
+			}
+		}
+		log.Printf("[bg-relocate] coarse 全部 %d 个 seed 最高 sharp=%.3f（<0.30），本次 discard；"+
+			"下次 streak=%d 会用更大半径", len(allSharp), maxAll, streak+1)
+		a.nav.mu.Lock()
+		a.nav.bgFailStreak++
+		a.nav.mu.Unlock()
 		return
 	}
+
+	// 阶段 2：重截小地图 + 小半径验证
+	//
+	// 动态半径：玩家在粗搜期间可能走了 speed×dt 世界单位。按 80 世界单位/秒
+	// 的"正常上限"估算，再乘 1.5 安全系数，转成 minimap-px。封顶 500 px
+	// 防止退化回全图搜。
+	img2, err := winutil.CaptureScreenRect(roi)
+	if err != nil {
+		log.Printf("[bg-relocate] capture2 failed: %v; discarded", err)
+		return
+	}
+	K := cfg.WorldUnitsPerMinimapPx
+	if K <= 0 {
+		K = 1.0
+	}
+	driftSeconds := coarseElapsed.Seconds() + 0.3 // +0.3 覆盖截图 / 调度
+	verifyRadius := 100 + int(driftSeconds*80.0/K*1.5)
+	if verifyRadius < 120 {
+		verifyRadius = 120
+	}
+	if verifyRadius > 500 {
+		verifyRadius = 500
+	}
+	em2 := locator.NewEdgeMatcher(mosaic, cfg.WorldUnitsPerMinimapPx)
+	em2.SearchZoom = zoom
+	em2.SearchRadiusMinPx = verifyRadius
+	em2.SearchRadiusMaxPx = verifyRadius
+	em2.MinSharpness = -1
+	em2.HeadingDetect = true
+	em2.DebugLog = cfg.DebugLog
+	em2.SetSeed(candidate.WorldX, candidate.WorldY)
+	verified, vErr := em2.Match(img2)
+	vSharp := em2.LastDebug.Sharpness
+	log.Printf("[bg-relocate] verify: sharp=%.3f radius=%d at (%.0f, %.0f); candidate was (%.0f, %.0f)",
+		vSharp, verifyRadius, verified.WorldX, verified.WorldY, candidate.WorldX, candidate.WorldY)
+	if vErr != nil && vSharp <= 0 {
+		log.Printf("[bg-relocate] verify err=%v (sharp=0); discarded", vErr)
+		a.nav.mu.Lock()
+		a.nav.bgFailStreak++
+		a.nav.mu.Unlock()
+		return
+	}
+	if vSharp < 0.30 {
+		log.Printf("[bg-relocate] verify sharp %.3f < 0.30; discarded (玩家可能已走远或粗搜误命中)", vSharp)
+		a.nav.mu.Lock()
+		a.nav.bgFailStreak++
+		a.nav.mu.Unlock()
+		return
+	}
+	// 验证通过：清零失败计数 + 写入 hash 缓存 + 用 verify 的 fix 作为权威结果
+	a.nav.mu.Lock()
+	a.nav.bgFailStreak = 0
+	a.nav.lastBgFrameHash = h1
+	a.nav.lastBgFrameHashValid = true
+	a.nav.mu.Unlock()
+	best := verified
+	best.Confidence = vSharp
+
 	// 更新主 matcher 的 seed —— 通过重建 matchFn 热替换
 	a.nav.mu.Lock()
 	loc := a.nav.loc
@@ -1190,11 +1484,16 @@ func (a *App) runBgReLocalize(reason string) {
 	cfg2 := a.settings.Get()
 	newMatch := a.buildRealMatcher(cfg2, best.WorldX, best.WorldY)
 	loc.SetMatch(newMatch)
-	// 立刻把显示位置更新为重定位结果
+	// 立刻把显示位置更新为重定位结果，并登记为"刚被确认"（供 plausibility 判传送）
 	a.nav.mu.Lock()
 	a.nav.fix = best
 	a.nav.hasFix = true
 	a.nav.lost = false
+	a.nav.bgRelocateConfirmAt = time.Now()
+	a.nav.bgRelocateConfirmX = best.WorldX
+	a.nav.bgRelocateConfirmY = best.WorldY
+	// 主匹配 seed 已被热替换，旧 lastFrameFix 对应旧 seed，清空避免误命中
+	a.nav.lastFrameHashValid = false
 	a.nav.mu.Unlock()
 	a.settings.Update(func(s *Settings) {
 		s.LastPlayerX = best.WorldX
@@ -1256,20 +1555,15 @@ func (a *App) collectReLocalizeSeeds() []locator.Fix {
 			add(pt.Point.Lng, pt.Point.Lat)
 		}
 	}
-	// 限制候选数量（每个 seed 都会跑一次广域 NCC，太多会很慢）
-	const maxSeeds = 12
+	// 限制候选数量（每个 seed 都会跑一次 EdgeMatcher.Match，太多会很慢）。
+	// 6 个足以覆盖：当前 fix / LastPlayer / 视图中心 / 最有可能的 1~2 个路径节点。
+	const maxSeeds = 6
 	if len(seen) > maxSeeds {
 		seen = seen[:maxSeeds]
 	}
 	return seen
 }
 
-func topScore(cs []locator.MultiSeedCandidate) float64 {
-	if len(cs) == 0 {
-		return 0
-	}
-	return cs[0].Score
-}
 // 主线程只负责显示"计算中…"提示和在完成后应用结果并触发重绘。
 func (a *App) solveTSPAsync() {
 	n := len(a.editor.Selection())
@@ -1309,16 +1603,56 @@ func (a *App) solveTSPAsync() {
 func (a *App) StopNavigation() {
 	a.nav.mu.Lock()
 	loc := a.nav.loc
+	cancel := a.nav.periodicRelocateCancel
 	a.nav.active = false
 	a.nav.routeID = ""
 	a.nav.loc = nil
 	a.nav.hasFix = false
+	a.nav.periodicRelocateCancel = nil
+	// 清理跨 session 状态：防止下次 Start 带着旧 progress / bgFailStreak / 哈希
+	a.nav.progress = NavProgress{}
+	a.nav.bgFailStreak = 0
+	a.nav.lastFrameHashValid = false
+	a.nav.lastBgFrameHashValid = false
 	a.nav.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if loc != nil {
 		loc.Stop()
 	}
 	if a.Window != nil {
 		a.Window.Invalidate()
+	}
+}
+
+// runPeriodicRelocate 在 nav 活动期间每 6 秒触发一次后台多种子重定位。
+// requestBgReLocalize 内部已有 6s 节流和互斥，所以即使主匹配途中也触发了
+// 重定位，本协程不会造成重复运行；它只保证"哪怕主匹配把玩家锁在错误吸引子
+// 上、永远到不了 LOST 阈值"的场景下也会有一个稳定的 ground truth 流。
+func (a *App) runPeriodicRelocate(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[periodic-relocate] panic: %v", r)
+		}
+	}()
+	t := time.NewTicker(6 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			a.nav.mu.Lock()
+			active := a.nav.active
+			a.nav.mu.Unlock()
+			if !active {
+				return
+			}
+			// 周期 ticker 绕过 6s 节流：只受"上次未完成"互斥约束，
+			// 避免"ticker 6s + 执行 3s"退化为 9s 周期。
+			a.requestBgReLocalizeOpts("periodic 6s", true)
+		}
 	}
 }
 
@@ -1344,6 +1678,17 @@ func (a *App) handleNavFix(f locator.Fix, p *mapdata.Path) {
 	a.nav.mu.Lock()
 	prev := a.nav.fix
 	hadPrev := a.nav.hasFix
+	// snap 冻结期：用户校准后的 3 秒内，新 fix 的位置被强制回滚到
+	// (snapFreezeX, snapFreezeY)；matcher 的 seed 仍会推进到真实匹配点，
+	// 但显示不动，避免视觉瞬移。
+	if !a.nav.snapFreezeUntil.IsZero() && now.Before(a.nav.snapFreezeUntil) {
+		f.WorldX = a.nav.snapFreezeX
+		f.WorldY = a.nav.snapFreezeY
+	}
+	// rejected 标记：本帧因为异常移动被 plausibility 拒绝。
+	// 拒绝后需要做一系列"不污染"操作：保留 prev 位置 / 朝向、不更新 lastFixAt、
+	// 不进 speedEMA。
+	rejected := false
 	// 1. 滞回
 	if hadPrev && !f.Tentative && !prev.Tentative {
 		dx := f.WorldX - prev.WorldX
@@ -1358,8 +1703,52 @@ func (a *App) handleNavFix(f locator.Fix, p *mapdata.Path) {
 			f.WorldY = prev.WorldY
 		}
 	}
-	// 2. 速度估计（指数平滑 α=0.4），tentative 不参与
-	if hadPrev && !a.nav.lastFixAt.IsZero() && !f.Tentative {
+	// 1b. 异常移动拒绝：连续追踪中突发大跳变（远超 EMA 速度 × dt）大概率是
+	// 主匹配掉到了别处的吸引子上。把它降级为 tentative 并丢弃 seed 推进，
+	// 等待 10 秒周期 bg 重定位来给出真值（传送 / 进新地图场景下 bg 会确认
+	// 新位置，本拒绝就不再触发）。
+	//
+	// 通过条件：
+	//   - 有前一帧 fix
+	//   - dt 在合理范围 (0.05 ~ 3s)
+	//   - 已经攒过 EMA 速度
+	//   - 隐含速度 > max(80 世界单位/秒, 6 × speedEMA)（80 是绝对下限，对应
+	//     ≈ 250 ms 内跨 20 minimap-px，正常步行 / 跑酷不会触发）
+	//   - 最近 12 秒内没有 bg 重定位"确认"了新位置（=不是传送）
+	if hadPrev && !f.Tentative && !a.nav.lastFixAt.IsZero() {
+		dt := now.Sub(a.nav.lastFixAt).Seconds()
+		if dt > 0.05 && dt < 3.0 {
+			ddx := f.WorldX - prev.WorldX
+			ddy := f.WorldY - prev.WorldY
+			impliedSpeed := math.Sqrt(ddx*ddx+ddy*ddy) / dt
+			speedCap := 80.0
+			if a.nav.speedEMAReady && a.nav.speedEMA*6 > speedCap {
+				speedCap = a.nav.speedEMA * 6
+			}
+			confirmedTeleport := !a.nav.bgRelocateConfirmAt.IsZero() &&
+				time.Since(a.nav.bgRelocateConfirmAt) < 12*time.Second
+			if impliedSpeed > speedCap && !confirmedTeleport {
+				if cfg.DebugLog {
+					log.Printf("[plausibility] reject fix: speed=%.1f > cap=%.1f (ema=%.1f) dt=%.2fs",
+						impliedSpeed, speedCap, a.nav.speedEMA, dt)
+				}
+				// 不污染原则：位置 / 朝向回滚到 prev；本帧不计入速度 EMA、
+				// 不更新 lastFixAt。Confidence 仍写入新值，让 UI 状态栏告知
+				// 用户当前匹配很差。
+				f.Tentative = true
+				f.WorldX = prev.WorldX
+				f.WorldY = prev.WorldY
+				f.Heading = prev.Heading
+				f.HasHeading = prev.HasHeading
+				rejected = true
+				go a.requestBgReLocalize("plausibility reject")
+			}
+		}
+	}
+	// 2. 速度估计：tentative 不参与，rejected 不参与。
+	//    speedEMA 进一步要求 sharp ≥ 0.30（高档）—— 中档数据的隐含速度
+	//    不可信，放进 EMA 会拉漂基线、削弱 plausibility 检测的有效性。
+	if hadPrev && !a.nav.lastFixAt.IsZero() && !f.Tentative && !rejected {
 		dt := now.Sub(a.nav.lastFixAt).Seconds()
 		if dt > 0.05 && dt < 3.0 {
 			instVX := (f.WorldX - prev.WorldX) / dt
@@ -1367,16 +1756,49 @@ func (a *App) handleNavFix(f locator.Fix, p *mapdata.Path) {
 			const alpha = 0.4
 			a.nav.velX = a.nav.velX*(1-alpha) + instVX*alpha
 			a.nav.velY = a.nav.velY*(1-alpha) + instVY*alpha
+			// |inst speed| 的 EMA：仅高档参与，避免中档错位污染基线
+			if f.Confidence >= 0.30 {
+				const speedAlpha = 0.15
+				instSpeed := math.Sqrt(instVX*instVX + instVY*instVY)
+				if a.nav.speedEMAReady {
+					a.nav.speedEMA = a.nav.speedEMA*(1-speedAlpha) + instSpeed*speedAlpha
+				} else {
+					a.nav.speedEMA = instSpeed
+					a.nav.speedEMAReady = true
+				}
+			}
 		}
 	} else if !hadPrev {
 		a.nav.velX = 0
 		a.nav.velY = 0
+		a.nav.speedEMA = 0
+		a.nav.speedEMAReady = false
 	}
-	a.nav.lastFixAt = now
+	// rejected 帧不更新 lastFixAt：让下次 dt 仍以最后一个真实 fix 为基准，
+	// 防止"密集错误帧 → 短 dt → 隐含速度变小 → 漏检"的自降级。
+	if !rejected {
+		a.nav.lastFixAt = now
+	}
 	// 3. 进度
+	//
+	// 分段锁定：用 ProjectOnPathLocked 替代全局 ProjectOnPath，避免玩家偏离
+	// 时投影被"串"到后续段（路径自交 / 平行段 / 回环处特别容易出这种问题）。
+	//
+	// 初始化：导航刚启动 / 刚从无 progress 切到有 progress 时，用一次全局
+	// ProjectOnPath 给 LockedSegmentIndex 一个合理初值（基于玩家当前实际位置，
+	// 不强制从段 0 开始）。之后每一帧都只允许在 [locked, locked+1] 范围内投影，
+	// 并按 T ≥ 0.95 推进。
 	var prog NavProgress
-	if p != nil {
-		prog = ProjectOnPath(p.Nodes, f.WorldX, f.WorldY)
+	if p != nil && len(p.Nodes) >= 2 {
+		prevProg := a.nav.progress
+		if !hadPrev || (prevProg.Total == 0 && prevProg.SegmentIndex == 0 && prevProg.T == 0) {
+			// 首次：全局投影得初始段
+			init := ProjectOnPath(p.Nodes, f.WorldX, f.WorldY)
+			init.LockedSegmentIndex = init.SegmentIndex
+			prog = init
+		} else {
+			prog = ProjectOnPathLocked(p.Nodes, f.WorldX, f.WorldY, prevProg.LockedSegmentIndex)
+		}
 	}
 	a.nav.fix = f
 	a.nav.hasFix = true
@@ -1471,7 +1893,14 @@ func (a *App) applySettingsToMapView() {
 			return false
 		case CenterNavOnly:
 			_, routeID, _, _, _ := a.nav.snapshot()
-			return routeID != "" // 纯追踪没有 routeID → 不居中
+			if routeID == "" {
+				return false
+			}
+		}
+		// 用户最近 10 秒内拖动 / 缩放过地图 → 暂时关掉自动居中，
+		// 让用户能自由查看地图其他区域；空闲 10s 后再恢复。
+		if a.mapView != nil && a.mapView.TimeSinceUserInteract() < 10*time.Second {
+			return false
 		}
 		return true
 	}

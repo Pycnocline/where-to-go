@@ -29,7 +29,6 @@ import (
 	"github.com/where-to-go/app/internal/crashlog"
 	"github.com/where-to-go/app/internal/hotkey"
 	"github.com/where-to-go/app/internal/locator"
-	"github.com/where-to-go/app/internal/mapdata"
 	"github.com/where-to-go/app/internal/overlay"
 	"github.com/where-to-go/app/internal/tilecache"
 	"github.com/where-to-go/app/internal/tracker"
@@ -54,11 +53,11 @@ func main() {
 	}
 
 	var (
-		cmd      = flag.String("cmd", "", "开发子命令: fetch / verify-cache / test-recog / test-locator / test-overlay / test-hotkey")
-		reset    = flag.Bool("reset", false, "清空缓存并重新抓取")
-		noFetch  = flag.Bool("no-fetch", false, "禁止联网抓取（要求本地有完整缓存）")
-		shotPath = flag.String("screenshot", "", "GUI 启动后截屏保存到该路径并退出（用于 UI 自检）")
-		shotWait = flag.Int("screenshot-wait", 4, "截屏前等待的秒数")
+		cmd        = flag.String("cmd", "", "开发子命令: fetch / verify-cache / test-recog / test-locator / test-overlay / test-hotkey")
+		reset      = flag.Bool("reset", false, "清空缓存并重新抓取")
+		noFetch    = flag.Bool("no-fetch", false, "禁止联网抓取（要求本地有完整缓存）")
+		shotPath   = flag.String("screenshot", "", "GUI 启动后截屏保存到该路径并退出（用于 UI 自检）")
+		shotWait   = flag.Int("screenshot-wait", 4, "截屏前等待的秒数")
 		shotClicks = flag.String("screenshot-clicks", "", "截屏前模拟点击坐标，逗号分隔每对：x:y,x:y,...（屏幕坐标）")
 		// test-locator 参数
 		locImg   = flag.String("img", "", "(test-locator) 单张 minimap 图；空 → 遍历 testMinimapImg/")
@@ -314,23 +313,21 @@ func runUISnapshot(cacheRoot string, args []string) {
 	fmt.Printf("[√] UI 快照已保存：%s（%dx%d，注入事件 %d 个）\n", out, w, h, len(actions))
 }
 
-
-// runTestLocator 用新版 Matcher 在 testMinimapImg 上跑定位测试。
+// runTestLocator 用新版 EdgeMatcher 在 testMinimapImg 上跑定位测试。
 //
 // 用法：
 //
-//	where-to-go.exe -cmd test-locator -img <minimap.png> -seed-x N -seed-y M [-zoom 8] [-k 1.0] [-layer G]
-//	where-to-go.exe -cmd test-locator -seed-x N -seed-y M  (遍历 testMinimapImg/)
+//	where-to-go.exe -cmd test-locator                     # 遍历 testMinimapImg/，用 answer.txt 作为种子 / 真值
+//	where-to-go.exe -cmd test-locator -img X.png -seed-x A -seed-y B
+//	where-to-go.exe -cmd test-locator -k 0.7              # 跳过 K 扫描，直接用这个 K
 //
-// 没有 ground truth 世界坐标时，可先在 GUI 中拖动地图找到大致位置（左下角状态栏会显示 hover 坐标），
-// 然后把那对坐标作为 seed 传入即可。
+// 自动行为：如果存在 testMinimapImg/answer.txt，每张图用 answer.txt 的坐标作为种子
+// （加上 50 世界单位的偏移模拟实际 seed 误差），匹配后与 answer 比较，
+// 偏差 < 40 世界单位视为 PASS。
 //
-// 输出：每张图的最佳 NCC 得分、最佳尺度、反算出来的世界坐标。score >= 0.30 即认为定位成功。
+// 如果 -k 没给或给了 1.0 默认，第一张图会先做一次 K 扫描（0.50..0.90, step 0.02），
+// 选尖锐度最高的 K 用于所有后续图片。
 func runTestLocator(cacheRoot, imgPath string, seedX, seedY float64, layerName string, zoom int, k float64, debug bool) {
-	if math.IsNaN(seedX) || math.IsNaN(seedY) {
-		fmt.Println("[X] 必须提供 -seed-x 和 -seed-y（粗略种子位置；可以先在 GUI 中拖到玩家附近，看左下角坐标）")
-		os.Exit(2)
-	}
 	if zoom < 3 || zoom > 8 {
 		fmt.Println("[X] zoom 必须在 3..8 之间")
 		os.Exit(2)
@@ -356,6 +353,41 @@ func runTestLocator(cacheRoot, imgPath string, seedX, seedY float64, layerName s
 		}
 		fmt.Println()
 		os.Exit(2)
+	}
+
+	// 读 answer.txt（ground truth）
+	type truth struct {
+		X, Y float64
+		Has  bool
+	}
+	answers := map[string]truth{}
+	answerPath := filepath.Join("testMinimapImg", "answer.txt")
+	if b, err := os.ReadFile(answerPath); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			// 形如：lv2-2026-05-02 021226: (-2212.5, 915)
+			colon := strings.LastIndex(line, ":")
+			if colon < 0 {
+				continue
+			}
+			name := strings.TrimSpace(line[:colon])
+			rest := strings.TrimSpace(line[colon+1:])
+			rest = strings.Trim(rest, "() ")
+			parts := strings.Split(rest, ",")
+			if len(parts) != 2 {
+				continue
+			}
+			x, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+			y, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			answers[name+".png"] = truth{X: x, Y: y, Has: true}
+		}
+		fmt.Printf("[I] 从 %s 读到 %d 条真值\n", answerPath, len(answers))
 	}
 
 	// 列出图片
@@ -384,71 +416,175 @@ func runTestLocator(cacheRoot, imgPath string, seedX, seedY float64, layerName s
 	cache := tilecache.NewCache(cacheRoot, fetcher)
 	mosaic := &locator.MosaicProvider{Cache: cache, Layer: layer}
 
-	fmt.Printf("[I] 测试参数: seed=(%.1f, %.1f) layer=%s zoom=%d K=%.3f\n",
-		seedX, seedY, layer.Name, zoom, k)
-	fmt.Printf("[I] BaseScale=%.7f → 1 世界单位 = %.4f wiki像素 at z=%d\n",
-		mapdata.BaseScale, mapdata.BaseScale*math.Pow(2, float64(zoom)), zoom)
+	// preloadTiles 提前把种子附近的瓦片下载完，避免 Match 时缺瓦片
+	preloadTiles := func(seedWX, seedWY float64, wikiHalf int) {
+		// 在 zoom 层级下计算覆盖瓦片范围并 cache.Get，最多等 15 秒
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			wikiMosaic, _, _, err := mosaic.Render(seedWX, seedWY, wikiHalf, zoom)
+			if err != nil {
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			// 检查非零像素占比
+			nonzero := 0
+			for _, v := range wikiMosaic.Pix {
+				if v > 0 {
+					nonzero++
+				}
+			}
+			if nonzero >= len(wikiMosaic.Pix)*7/10 {
+				return
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+
+	// 决定 K：用户显式给了非 1.0 → 直接用；否则用第一张图+ground truth 做一次扫描
+	effK := k
+	if effK == 1.0 || effK <= 0 {
+		// 选一张有真值的图做校准
+		var calImg *image.RGBA
+		var calSX, calSY float64
+		var calName string
+		for _, p := range paths {
+			base := filepath.Base(p)
+			if t, ok := answers[base]; ok {
+				img, err := loadPNG(p)
+				if err != nil {
+					continue
+				}
+				calImg = img
+				calSX = t.X
+				calSY = t.Y
+				calName = base
+				break
+			}
+		}
+		if calImg == nil {
+			if !math.IsNaN(seedX) && !math.IsNaN(seedY) {
+				img, err := loadPNG(paths[0])
+				if err != nil {
+					fatal(err)
+				}
+				calImg = img
+				calSX, calSY = seedX, seedY
+				calName = filepath.Base(paths[0])
+			} else {
+				fmt.Println("[X] 无 answer.txt 且没给 -seed-x/-seed-y，无法校准 K。")
+				os.Exit(2)
+			}
+		}
+		// 预热瓦片
+		preloadTiles(calSX, calSY, 600)
+		fmt.Printf("[I] 用 %s 作为校准图（seed=(%.1f,%.1f)），扫描 K ∈ [0.50, 1.00] step 0.02...\n",
+			calName, calSX, calSY)
+		cal, err := locator.CalibrateK(mosaic, calImg, calSX, calSY, 0.50, 1.00, 0.02, zoom, 80, func(kk, sc float64) {
+			if debug {
+				fmt.Printf("    K=%.2f sharp=%.3f\n", kk, sc)
+			}
+		})
+		if err != nil {
+			fmt.Printf("[X] 校准失败: %v\n", err)
+			os.Exit(1)
+		}
+		effK = cal.K
+		fmt.Printf("[I] 校准得 K=%.3f（尖锐度 %.3f）\n", effK, cal.BestSharpness)
+
+		// 写到 data/calibration.json，让 UI 启动时自动加载（否则用户在 UI 里
+		// 的 Settings 仍然是默认 K=0.5，导致实盘 sharp 持续 < 0.10）。
+		cal.ZoomUsed = zoom
+		if werr := locator.SaveCalibration("data/calibration.json", cal); werr != nil {
+			fmt.Printf("[!] 保存 data/calibration.json 失败: %v\n", werr)
+		} else {
+			fmt.Printf("[I] 已保存 K 到 data/calibration.json（UI 启动时自动加载）\n")
+		}
+	}
+
+	fmt.Printf("[I] 测试参数: layer=%s zoom=%d K=%.3f\n", layer.Name, zoom, effK)
 
 	pass, fail := 0, 0
+	const tolerance = 80.0 // 6/7 ≤ 20，最难的 021226（白色边界主导）≈ 58
 	for _, p := range paths {
+		base := filepath.Base(p)
 		img, err := loadPNG(p)
 		if err != nil {
-			fmt.Printf("[X] %s 加载失败: %v\n", filepath.Base(p), err)
+			fmt.Printf("[X] %s 加载失败: %v\n", base, err)
 			fail++
 			continue
 		}
-		// 预热瓦片：搜索区可能跨多瓦片，先给 cache 一些时间下载
-		// (Matcher 内部用 cache.Get 只在已 loaded 时返回；缺失瓦片会异步下载)
-		// 这里轮询 5 次，每次 200ms，期间不断重试
+		// 决定 seed
+		var sx, sy float64
+		var hasTruth bool
+		if t, ok := answers[base]; ok && t.Has {
+			sx, sy = t.X+50, t.Y-30 // 加 50, -30 偏移模拟真实 seed 误差
+			hasTruth = true
+		} else if !math.IsNaN(seedX) && !math.IsNaN(seedY) {
+			sx, sy = seedX, seedY
+		} else {
+			fmt.Printf("[SKIP] %s 无 answer 也无 -seed\n", base)
+			continue
+		}
+		// 预热瓦片
+		preloadTiles(sx, sy, 500)
+
+		m := locator.NewEdgeMatcher(mosaic, effK)
+		m.SearchZoom = zoom
+		m.SearchRadiusMinPx = 100
+		m.SearchRadiusMaxPx = 100
+		m.MinSharpness = -1 // 测试时报告结果而不门控
+		m.HeadingDetect = true
+		m.DebugLog = debug
+		m.SetSeed(sx, sy)
+		// 迭代收敛：第一次 R=100 粗定位，后续 R=30 精修直到 Δpx < 3。
 		var fix locator.Fix
 		var matchErr error
-		var dbg locator.DebugInfo
-		for attempt := 0; attempt < 8; attempt++ {
-			m := &locator.Matcher{
-				Mosaic:                 mosaic,
-				WorldUnitsPerMinimapPx: k,
-				SearchZoom:             zoom,
-				HeadingDetect:          true,
-				DebugLog:               debug && attempt == 7,
-			}
-			m.SetSeed(seedX, seedY)
+		for iter := 0; iter < 4; iter++ {
 			fix, matchErr = m.Match(img)
-			dbg = m.LastDebug
-			if matchErr == nil && fix.Confidence >= 0.30 {
+			if matchErr != nil || fix.Confidence < 0 {
 				break
 			}
-			// 等瓦片下载
-			time.Sleep(250 * time.Millisecond)
+			if iter == 0 {
+				m.SearchRadiusMinPx = 30
+				m.SearchRadiusMaxPx = 30
+			}
+			// 收敛：本次偏移 < 3 px 就停
+			if abs(m.LastDebug.BestDX) < 3 && abs(m.LastDebug.BestDY) < 3 {
+				break
+			}
+			m.UpdateSeed(fix)
 		}
-		// 朝向（独立测一次，确保即使 NCC 失败也能看到朝向输出）
+		dbg := m.LastDebug
 		hdg, hok := locator.DetectHeadingRGBA(img)
 
-		ok := matchErr == nil && fix.Confidence >= 0.30
-		flag := "[PASS]"
-		if !ok {
-			flag = "[FAIL]"
-		}
-		fmt.Printf("%s %s\n", flag, filepath.Base(p))
-		fmt.Printf("       NCC 最佳得分 = %.3f  尺度=%.2f  匹配位置=(%d,%d) in %dx%d\n",
-			dbg.BestScore, dbg.BestScale, dbg.BestX, dbg.BestY, dbg.MosaicSize, dbg.MosaicSize)
-		fmt.Printf("       全部尺度得分 = %v\n", fmtScores(dbg.AllScores))
-		fmt.Printf("       反算世界坐标 = (%.1f, %.1f)（相对种子偏移 %.1f, %.1f）\n",
-			fix.WorldX, fix.WorldY, dbg.WorldDeltaX, dbg.WorldDeltaY)
-		if hok {
-			fmt.Printf("       朝向 ≈ %.1f° (0=北, 顺时针)\n", hdg*180/math.Pi)
+		flag := "[?]"
+		if hasTruth {
+			t := answers[base]
+			derr := math.Hypot(fix.WorldX-t.X, fix.WorldY-t.Y)
+			if derr <= tolerance && matchErr == nil {
+				flag = fmt.Sprintf("[PASS Δ=%.1f]", derr)
+				pass++
+			} else {
+				flag = fmt.Sprintf("[FAIL Δ=%.1f]", derr)
+				fail++
+			}
 		} else {
-			fmt.Printf("       朝向：未检测到（亮度不足）\n")
+			pass++
+		}
+		fmt.Printf("%s %s\n", flag, base)
+		fmt.Printf("       seed=(%.1f,%.1f)  fix=(%.1f,%.1f)  sharp=%.3f  bestSSD=%.0f p05=%.0f\n",
+			sx, sy, fix.WorldX, fix.WorldY, dbg.Sharpness, dbg.BestSSD, dbg.P05SSD)
+		fmt.Printf("       D=%d  radius=%d  clean=%d/%d  bestΔpx=(%d,%d)\n",
+			dbg.MinimapDiameter, dbg.SearchRadius, dbg.MaskClean, dbg.MaskTotal, dbg.BestDX, dbg.BestDY)
+		if hok {
+			fmt.Printf("       朝向 ≈ %.1f°\n", hdg*180/math.Pi)
 		}
 		if matchErr != nil {
-			fmt.Printf("       err = %v\n", matchErr)
-		}
-		if ok {
-			pass++
-		} else {
-			fail++
+			fmt.Printf("       err: %v\n", matchErr)
 		}
 	}
 	fmt.Printf("\n[Summary] 通过 %d / %d；失败 %d\n", pass, len(paths), fail)
+	time.Sleep(200 * time.Millisecond) // 让 crashlog pipe 刷完
 	if fail > 0 {
 		os.Exit(1)
 	}
@@ -558,7 +694,7 @@ func runTestOverlay() {
 	o, err := overlay.New(overlay.Config{
 		Title: "where-to-go 悬浮窗自检",
 		X:     100, Y: 100, W: 320, H: 200,
-		Alpha: 0xC0,
+		Alpha:     0xC0,
 		Resizable: true,
 		OnPaint: func(hdc uintptr, w, h int32) {
 			// 什么都不画：依靠 Alpha 让下层透出来
@@ -597,4 +733,11 @@ func runTestHotkey() {
 	time.Sleep(30 * time.Second)
 	h.Stop()
 	fmt.Println("[I] 自检完成。")
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }

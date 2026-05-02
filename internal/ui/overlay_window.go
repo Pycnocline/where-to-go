@@ -446,6 +446,7 @@ func (o *OverlayWindow) onPaint(hdc uintptr, cw, ch int32) {
 		diBRGBColors,
 		srcCopy,
 	)
+	putBGRABuf(buf)
 }
 
 func fillRectSolid(hdc uintptr, x, y, w, h int32, rgb uint32) {
@@ -457,16 +458,42 @@ func fillRectSolid(hdc uintptr, x, y, w, h int32, rgb uint32) {
 	procDeleteObjectOL.Call(brush)
 }
 
+// bgraBufPool 复用 toBGRA 的输出 slice，避免每帧 ~200KB 的 GC 压力。
+// 用 pointer-to-slice 避免 sync.Pool 把 slice 拆解（Go 1.22+ 推荐写法）。
+var bgraBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 256*1024)
+		return &b
+	},
+}
+
 // toBGRA 把 image.RGBA 的像素字节序从 R,G,B,A 翻到 B,G,R,A（DIB 需要的格式）。
-// 复制一份，避免修改 Gio screenshot 返回的原 slice（它可能被再用）。
+// 返回的 slice 来自 bgraBufPool；调用方用完后调用 putBGRABuf 归还。
+// 注意：fillRectSolid 的备份路径不需要 buf，所以池只服务 onPaint 主路径。
 func toBGRA(src *image.RGBA) []byte {
 	n := len(src.Pix)
-	buf := make([]byte, n)
+	bp := bgraBufPool.Get().(*[]byte)
+	buf := *bp
+	if cap(buf) < n {
+		buf = make([]byte, n)
+	} else {
+		buf = buf[:n]
+	}
 	for i := 0; i < n; i += 4 {
 		buf[i+0] = src.Pix[i+2] // B <- R
 		buf[i+1] = src.Pix[i+1] // G
 		buf[i+2] = src.Pix[i+0] // R <- B
 		buf[i+3] = src.Pix[i+3] // A
 	}
+	*bp = buf
 	return buf
+}
+
+// putBGRABuf 归还 toBGRA 借出的 buffer。在 procStretchDIBits.Call 之后立即归还。
+func putBGRABuf(buf []byte) {
+	if cap(buf) == 0 {
+		return
+	}
+	b := buf[:0]
+	bgraBufPool.Put(&b)
 }

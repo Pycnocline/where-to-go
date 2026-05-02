@@ -104,16 +104,16 @@ func DefaultSettings() Settings {
 		IconSize:               24,
 		SelectionStyle:         SelectionHalo,
 		DebugLog:               false,
-		NavSimulator:           true, // 默认用模拟器，便于无游戏环境调试视觉
+		NavSimulator:           false, // 默认走真实截屏；模拟器仅供无游戏环境调试视觉
 		NavTracking:            false,
-		WorldUnitsPerMinimapPx: 0.5, // 经验默认：游戏内最大放大 ≈ wiki zoom 8 (1 mm-px ≈ 1 wiki-px @ z=8)
+		WorldUnitsPerMinimapPx: 0.5, // 经验默认；首次手动校准后会被实测值替换
 		NavAutoCenter:          true,
 		NavCenterMode:          CenterAlways,
 		NavFallback:            NavFallbackStay,
 		NavSearchZoom:          8, // wiki 最大 zoom，对应游戏内"最大放大"小地图
 		OverlayAlpha:           0xFF,
 		OverlayClickThrough:    false,
-		NavPredict:             true,
+		NavPredict:             false, // 默认关闭：预测在弱信号下会放大漂移；用户可在设置里开启
 	}
 }
 

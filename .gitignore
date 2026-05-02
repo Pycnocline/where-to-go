@@ -1,5 +1,27 @@
-cache/
-testMinimapImg/
+# 构建产物
+*.exe
 build/
-where-to-go.exe
+
+# 运行期数据（用户本地，不入库）
+cache/
 data/
+config.json
+
+# 调试 / 测试输入与日志
+testMinimapImg/
+*.crash.log
+*.log
+test-locator-out.txt
+d_compare_*.png
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Go 工具产出
+vendor/
+*.test
+*.prof
+coverage.out

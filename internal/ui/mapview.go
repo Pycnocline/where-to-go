@@ -110,6 +110,11 @@ type MapView struct {
 	// 完全不渲染文本" —— 节点编号、气泡、徽章等全部跳过，只保留图形层。
 	// 主窗口保持 overlayMode=false，功能完整。
 	overlayMode bool
+
+	// lastUserInteractAt 最近一次"用户主动移动/缩放地图"的墙钟时间。
+	// 用于让 AutoCenterFn 判断是否要临时解除自动居中。仅中键拖拽和滚轮缩放
+	// 写入；左键选择 / 路径编辑等不计。
+	lastUserInteractAt time.Time
 }
 
 // LayoutAs 用 mode 包装 Layout 调用，供悬浮窗在 overlayMode=true 下渲染。
@@ -133,6 +138,15 @@ func (m *MapView) SnapPlayerTo(wx, wy float64) {
 	m.smoothPX = wx
 	m.smoothPY = wy
 	m.smoothInit = true
+}
+
+// TimeSinceUserInteract 返回距离最近一次用户平移 / 缩放地图的时间。
+// 若从未交互过，返回一个足够大的值（> 1h）让调用方判为"已空闲足够久"。
+func (m *MapView) TimeSinceUserInteract() time.Duration {
+	if m.lastUserInteractAt.IsZero() {
+		return time.Hour
+	}
+	return time.Since(m.lastUserInteractAt)
 }
 
 // NewMapView 构造。Store 中应已加载元数据。
@@ -690,6 +704,10 @@ func (m *MapView) handleEvents(gtx layout.Context, size image.Point) {
 				newPy := float64(m.dragCenter.Y - dy)
 				m.centerX, m.centerY = mapdata.PixelToWorld(newPx, newPy, m.z)
 				m.updateMouseWorld(pe.Position, size)
+				// 标记用户交互时间，让 AutoCenter 在 10s 内挂起
+				if dx*dx+dy*dy > 1 {
+					m.lastUserInteractAt = time.Now()
+				}
 				continue
 			}
 		}
@@ -925,6 +943,8 @@ func (m *MapView) handleScroll(dy float32, pos f32.Point, size image.Point) {
 	if newZ < meta.MinZoom || newZ > meta.MaxZoom {
 		return
 	}
+	// 标记用户交互时间，让 AutoCenter 在 10s 内挂起
+	m.lastUserInteractAt = time.Now()
 	// 以鼠标处为锚点缩放：鼠标对应的世界坐标在缩放前后保持不变。
 	cpx, cpy := mapdata.WorldToPixel(m.centerX, m.centerY, m.z)
 	mx := cpx + float64(pos.X) - float64(size.X)/2
