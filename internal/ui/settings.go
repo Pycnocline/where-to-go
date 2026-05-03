@@ -51,7 +51,6 @@ type Settings struct {
 
 	// 导航相关
 	MinimapROI               MinimapROI  `json:"minimapRoi"`
-	NavSimulator             bool        `json:"navSimulator"`             // true = 用模拟器代替真截屏匹配
 	NavTracking              bool        `json:"navTracking"`              // true = 启用实时追踪玩家位置（独立于路径导航）
 	WorldUnitsPerMinimapPx   float64     `json:"worldUnitsPerMinimapPx"`   // 校准：游戏小地图 1px = 多少世界单位
 	NavAutoCenter            bool        `json:"navAutoCenter"`            // 已废弃保留兼容；用 NavCenterMode 代替
@@ -104,7 +103,6 @@ func DefaultSettings() Settings {
 		IconSize:               24,
 		SelectionStyle:         SelectionHalo,
 		DebugLog:               false,
-		NavSimulator:           false, // 默认走真实截屏；模拟器仅供无游戏环境调试视觉
 		NavTracking:            false,
 		WorldUnitsPerMinimapPx: 0.5, // 经验默认；首次手动校准后会被实测值替换
 		NavAutoCenter:          true,

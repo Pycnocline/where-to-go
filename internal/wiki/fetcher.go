@@ -222,11 +222,14 @@ func tileRefer(z int) int {
 	return (v + 1) / 2
 }
 
-// fetchOneTile 下载单张瓦片到磁盘缓存。已存在则跳过。
+// fetchOneTile 下载单张瓦片到磁盘缓存。已存在则跳过；先前确定为 404 的也跳过。
 func (f *Fetcher) fetchOneTile(ctx context.Context, ly Layer, z, x, y int) error {
 	dst := TilePath(f.CacheRoot, ly.Name, z, x, y)
 	if _, err := os.Stat(dst); err == nil {
 		return nil // 已缓存
+	}
+	if _, err := os.Stat(dst + ".404"); err == nil {
+		return nil // 已确认超出范围，避免重复请求 OSS
 	}
 	url := tileURL(ly.TileURL, z, x, y)
 	tmp := dst + ".part"

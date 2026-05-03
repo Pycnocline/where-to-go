@@ -1270,15 +1270,10 @@ func (m *MapView) drawNavRoute(gtx layout.Context, size image.Point, nodes []map
 		if !inView(sx, sy) {
 			continue
 		}
-		traveled := false
-		if hasFix && i <= prog.SegmentIndex && i > 0 {
-			// 节点 i 之前的段全部走过 → traveled
-			traveled = i <= prog.SegmentIndex
-			if hasFix && i-1 == prog.SegmentIndex && segs[i-1].split {
-				// split 段的末端（节点 i）尚未走过 → 仍属于未走色
-				traveled = false
-			}
-		}
+		// 节点 i 已走过 ⟺ 它位于已经穿过的段上：i ≤ SegmentIndex 时为已走过
+		// （包括起点 i=0：只要导航有 fix，玩家至少站在段 0 起点之上或之后）。
+		// 当前段尾节点 i = SegmentIndex+1 是"将要走到的下一个目标"，仍未走过。
+		traveled := hasFix && i <= prog.SegmentIndex
 		drawJoint(image.Pt(sx, sy), traveled)
 	}
 	// 玩家投影点（split 段中点）也画一个 joint，让灰→绿过渡平滑

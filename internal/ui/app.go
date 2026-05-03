@@ -142,6 +142,24 @@ type App struct {
 
 	// 致命错误
 	fatalErr error
+
+	// 全量瓦片下载状态（DownloadAllTilesAsync）。
+	// progress 形如 "已下载 1234 / 65536 (3.2 GB)"；done=true 时显示完成。
+	tilesDL tilesDLState
+}
+
+// tilesDLState 全量瓦片下载状态机。
+type tilesDLState struct {
+	mu       sync.Mutex
+	running  bool
+	cancel   context.CancelFunc
+	total    int
+	done     int
+	skipped  int
+	failed   int
+	bytes    int64
+	finished bool
+	err      string
 }
 
 // Config 启动 UI 所需的参数（由 main 注入）。
@@ -547,9 +565,8 @@ func (a *App) StartNavigation(routeID string) {
 
 	a.StopNavigation()
 
-	if cfg.NavSimulator || cfg.MinimapROI.Empty() {
-		// 模拟器模式：沿路径来回匀速运动
-		a.startNavSimulator(p, cfg)
+	if cfg.MinimapROI.Empty() {
+		a.hint = "导航失败：未设置小地图 ROI（请到设置 → 在屏幕上框选）"
 		return
 	}
 	if a.mapView == nil || a.cache == nil {
@@ -582,6 +599,8 @@ func (a *App) StartNavigation(routeID string) {
 				}
 			}
 		}()
+		// 预抓 seed 周围 z=NavSearchZoom 的瓦片（5×5），让首帧 Match 不空 cov
+		a.prefetchTilesForLocator(seedX, seedY, 2)
 		if skipWide {
 			// 已有可信 fix：直接构造 matcher + loop，绕过广域 + 多种子搜索阶段。
 			a.startMatcherLoopWithSeed(cfg, seedX, seedY, reuseFix, roi, routeID, p)
@@ -656,52 +675,6 @@ func (a *App) startMatcherLoopWithSeed(cfg Settings, seedX, seedY float64, initi
 	}
 }
 
-// startNavSimulator 模拟器模式导航 —— 保留原行为。
-func (a *App) startNavSimulator(p *mapdata.Path, cfg Settings) {
-	nodes := make([]locator.SimNode, len(p.Nodes))
-	for i, n := range p.Nodes {
-		nodes[i] = locator.SimNode{X: n.X, Y: n.Y}
-	}
-	sim := locator.NewSimulator(locator.SimulatorTrack{Nodes: nodes, Speed: 80})
-	matchFn := sim.Match
-	loc := locator.New(locator.Config{
-		ROI:      locator.ROI{X: cfg.MinimapROI.X, Y: cfg.MinimapROI.Y, W: cfg.MinimapROI.W, H: cfg.MinimapROI.H},
-		Interval: 250 * time.Millisecond,
-		Match:    matchFn,
-	})
-	loc.SetROI(locator.ROI{X: 0, Y: 0, W: 1, H: 1})
-	loc.SetCapture(func(_ locator.ROI) (*image.RGBA, error) {
-		return image.NewRGBA(image.Rect(0, 0, 1, 1)), nil
-	})
-	loc.OnFix = func(f locator.Fix) { a.handleNavFix(f, p) }
-	loc.OnErr = func(err error) {
-		if err == locator.ErrNotImplemented {
-			return
-		}
-		a.applyNavFallback(err)
-	}
-	a.nav.mu.Lock()
-	a.nav.active = true
-	a.nav.routeID = p.Name // 用名字暂存（Simulator 模式下 routeID 只用于"有路径"判定）
-	a.nav.loc = loc
-	a.nav.startedAt = time.Now()
-	a.nav.hasFix = false
-	a.nav.mu.Unlock()
-	// 更严格：routeID 实际要用 p 的 ID 而不是 Name；sim 模式下需要传递
-	// 参考其他代码查 Find(routeID) 用的是路径的 ID；暂保留以免回归。
-	if err := loc.Start(); err != nil {
-		a.hint = "启动定位器失败：" + err.Error()
-		a.nav.mu.Lock()
-		a.nav.active = false
-		a.nav.mu.Unlock()
-		return
-	}
-	a.hint = "已开始导航（模拟）：" + p.Name
-	if a.Window != nil {
-		a.Window.Invalidate()
-	}
-}
-
 // StartTracking 启动"实时追踪玩家位置"模式（无路径）。已有导航/追踪在跑则先停止。
 //
 // 启动时先做一次"广域校准"：在 K × [0.4..2.5] 9 个尺度 + ±200 模板像素半径
@@ -746,6 +719,8 @@ func (a *App) StartTracking() {
 				}
 			}
 		}()
+		// 预抓 seed 周围 5×5 瓦片
+		a.prefetchTilesForLocator(seedX, seedY, 2)
 		img, err := winutil.CaptureScreenRect(image.Rect(roi.X, roi.Y, roi.X+roi.W, roi.Y+roi.H))
 		if err != nil {
 			a.hint = "追踪失败：截屏错误 " + err.Error()
@@ -1137,6 +1112,8 @@ func (a *App) CalibrateAtWorld(wx, wy float64) string {
 	if zoom <= 0 {
 		zoom = 8
 	}
+	// 预抓 (wx,wy) 附近 5×5 瓦片：扫 K 阶段会用到 z=NavSearchZoom 的 mosaic
+	a.prefetchTilesForLocator(wx, wy, 2)
 
 	// 步骤 1：当前 K 快速评估
 	probe := func(k float64) float64 {
@@ -1847,7 +1824,233 @@ func (a *App) applyNavFallback(err error) {
 	}
 }
 
-// locatorLayerOf 取出指定 layer 名称对应的 wiki.Layer。找不到时返回零值。
+// prefetchTilesForLocator 在 (wx, wy) 周围、当前匹配 zoom 下预抓 (2*radius+1)²
+// 块瓦片。Cache.Get 在本地有就立即返回 cached，否则异步触发下载（不阻塞）。
+//
+// 调用时机：StartTracking / StartNavigation / CalibrateAtWorld。让 locator 真正
+// 开始 Match 时所需瓦片大概率已在本地或正在下载，避免冷启动时 cov=0 一片
+// 导致前几次 Match 命中率低。
+func (a *App) prefetchTilesForLocator(wx, wy float64, radius int) {
+	if a.cache == nil || a.mapView == nil {
+		return
+	}
+	cfg := a.settings.Get()
+	zoom := cfg.NavSearchZoom
+	if zoom <= 0 {
+		zoom = 8
+	}
+	layer := locatorLayerOf(a.store, a.mapView.Layer())
+	if layer.Name == "" {
+		return
+	}
+	cpx, cpy := mapdata.WorldToPixel(wx, wy, zoom)
+	cx := int(cpx) / mapdata.TileSize
+	cy := int(cpy) / mapdata.TileSize
+	count := 0
+	for dy := -radius; dy <= radius; dy++ {
+		for dx := -radius; dx <= radius; dx++ {
+			tx := cx + dx
+			ty := cy + dy
+			if !mapdata.IsTileInBounds(zoom, tx, ty, layer.X1, layer.X2, layer.Y1, layer.Y2) {
+				continue
+			}
+			a.cache.Get(layer, zoom, tx, ty)
+			count++
+		}
+	}
+	if cfg.DebugLog {
+		log.Printf("[prefetch] layer=%s z=%d center=(%d,%d) radius=%d → %d 瓦片预抓",
+			layer.Name, zoom, cx, cy, radius, count)
+	}
+}
+
+// DownloadAllTilesAsync 在后台批量下载所有图层、z=5..8 的有效瓦片。
+//
+// 工作原理：OSS 对超出地图范围的瓦片返回 404，因此理论枚举（每图层 z=8 高达
+// 262144 张）的绝大多数并不存在。实际实现按 zoom 逐级推进：z 层的某 (x,y)
+// 只有当 z-1 层 (⌊x/2⌋,⌊y/2⌋) 已作为 .png 落盘时才会被加入队列——这样每升
+// 一级最多把已知有效区翻四倍，避开了整片空白海域的假阴性请求。
+//
+// 进度通过 a.tilesDL 公开：done = 已处理 spec 数（含跳过），skipped 含已缓
+// 存 + 已知 404 + 本次 404，failed 只计真正的网络/HTTP 错误。
+func (a *App) DownloadAllTilesAsync() {
+	a.tilesDL.mu.Lock()
+	if a.tilesDL.running {
+		a.tilesDL.mu.Unlock()
+		return
+	}
+	if a.cache == nil || a.fetcher == nil {
+		a.tilesDL.err = "缓存或抓取器未就绪"
+		a.tilesDL.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.tilesDL.running = true
+	a.tilesDL.cancel = cancel
+	a.tilesDL.total = 0
+	a.tilesDL.done = 0
+	a.tilesDL.skipped = 0
+	a.tilesDL.failed = 0
+	a.tilesDL.bytes = 0
+	a.tilesDL.finished = false
+	a.tilesDL.err = ""
+	a.tilesDL.mu.Unlock()
+
+	go a.runDownloadAllTiles(ctx)
+}
+
+// CancelDownloadAllTiles 中断正在跑的全量下载。
+func (a *App) CancelDownloadAllTiles() {
+	a.tilesDL.mu.Lock()
+	cancel := a.tilesDL.cancel
+	a.tilesDL.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// TilesDLSnapshot 返回当前下载状态的副本，供 UI 渲染。
+func (a *App) TilesDLSnapshot() (running bool, done, total, skipped, failed int, bytes int64, finished bool, errMsg string) {
+	a.tilesDL.mu.Lock()
+	defer a.tilesDL.mu.Unlock()
+	return a.tilesDL.running, a.tilesDL.done, a.tilesDL.total, a.tilesDL.skipped, a.tilesDL.failed, a.tilesDL.bytes, a.tilesDL.finished, a.tilesDL.err
+}
+
+// runDownloadAllTiles 后台 worker pool 实现。按 zoom 分阶段：z=5 的枚举依赖
+// z=4（首次抓取时已下载）；z=6 依赖 z=5 本次刚完成的结果；依此类推。
+//
+// 枚举策略：遍历父层（z-1）在磁盘上已有的 .png 瓦片集合，每张父瓦片展开出
+// 4 张子瓦片（2x, 2y ~ 2x+1, 2y+1）。相比"全枚举子坐标 + 每个都 stat 父"
+// 的做法，stat 次数从 O(子面积) 降到 O(父面积)，减少约 16 倍 IO。
+func (a *App) runDownloadAllTiles(ctx context.Context) {
+	defer func() {
+		a.tilesDL.mu.Lock()
+		a.tilesDL.running = false
+		a.tilesDL.finished = true
+		a.tilesDL.cancel = nil
+		a.tilesDL.mu.Unlock()
+		if a.Window != nil {
+			a.Window.Invalidate()
+		}
+	}()
+
+	type tileSpec struct {
+		layer   wiki.Layer
+		z, x, y int
+	}
+
+	layers := a.store.Layers()
+	if len(layers) == 0 {
+		a.tilesDL.mu.Lock()
+		a.tilesDL.err = "图层列表为空（请先完成首次 Wiki 抓取）"
+		a.tilesDL.mu.Unlock()
+		return
+	}
+
+	const workers = 8
+	for _, z := range []int{5, 6, 7, 8} {
+		if ctx.Err() != nil {
+			return
+		}
+		parentZ := z - 1
+
+		// 枚举：遍历父层 (parentZ) 的理论范围，对每个存在 .png 的父坐标
+		// (px, py) 产出 4 张子瓦片 (2px..2px+1, 2py..2py+1)。对负数坐标
+		// 同样成立（子坐标范围 = 2 * 父坐标范围，首尾对齐）。
+		var specs []tileSpec
+		for _, ly := range layers {
+			pr := mapdata.TileRefer(parentZ)
+			px0, px1 := -pr*ly.X1, pr*ly.X2
+			py0, py1 := -pr*ly.Y1, pr*ly.Y2
+			for py := py0; py < py1; py++ {
+				for px := px0; px < px1; px++ {
+					parentPath := wiki.TilePath(a.cacheRoot, ly.Name, parentZ, px, py)
+					if _, err := os.Stat(parentPath); err != nil {
+						continue
+					}
+					for dy := 0; dy < 2; dy++ {
+						for dx := 0; dx < 2; dx++ {
+							specs = append(specs, tileSpec{ly, z, 2*px + dx, 2*py + dy})
+						}
+					}
+				}
+			}
+		}
+		a.tilesDL.mu.Lock()
+		a.tilesDL.total += len(specs)
+		a.tilesDL.mu.Unlock()
+		log.Printf("[tiles-dl] z=%d 枚举 %d 张（来自 z=%d 已覆盖父瓦片的 4 倍展开）", z, len(specs), parentZ)
+
+		specCh := make(chan tileSpec, 64)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for s := range specCh {
+					if ctx.Err() != nil {
+						return
+					}
+					pngPath := wiki.TilePath(a.cacheRoot, s.layer.Name, s.z, s.x, s.y)
+					// 已缓存：直接计 skipped，不打扰网络。
+					if fi, err := os.Stat(pngPath); err == nil {
+						a.tilesDL.mu.Lock()
+						a.tilesDL.done++
+						a.tilesDL.skipped++
+						a.tilesDL.bytes += fi.Size()
+						a.tilesDL.mu.Unlock()
+						continue
+					}
+					if _, err := os.Stat(pngPath + ".404"); err == nil {
+						a.tilesDL.mu.Lock()
+						a.tilesDL.done++
+						a.tilesDL.skipped++
+						a.tilesDL.mu.Unlock()
+						continue
+					}
+
+					path, err := a.fetcher.FetchTileOnDemand(ctx, s.layer, s.z, s.x, s.y)
+					if ctx.Err() != nil {
+						return
+					}
+					a.tilesDL.mu.Lock()
+					a.tilesDL.done++
+					switch {
+					case err == wiki.ErrTileOutOfBounds:
+						a.tilesDL.skipped++
+					case err != nil:
+						a.tilesDL.failed++
+					case path != "":
+						if fi, ferr := os.Stat(path); ferr == nil {
+							a.tilesDL.bytes += fi.Size()
+						}
+					}
+					a.tilesDL.mu.Unlock()
+				}
+			}()
+		}
+
+		stopped := false
+		for i, s := range specs {
+			select {
+			case <-ctx.Done():
+				stopped = true
+			case specCh <- s:
+			}
+			if stopped {
+				break
+			}
+			if i%200 == 0 && a.Window != nil {
+				a.Window.Invalidate()
+			}
+		}
+		close(specCh)
+		wg.Wait()
+		if stopped {
+			return
+		}
+	}
+}
 func locatorLayerOf(store *mapdata.Store, name string) wiki.Layer {
 	for _, ly := range store.Layers() {
 		if ly.Name == name {

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"time"
@@ -35,8 +36,7 @@ type SettingsView struct {
 	roiW        widget.Editor
 	roiH        widget.Editor
 	roiApply    widget.Clickable
-	roiPick     widget.Clickable
-	navSimChk   widget.Bool
+	roiPick    widget.Clickable
 	navTrackChk widget.Bool
 	navPredictChk widget.Bool
 	autoCenter   widget.Bool // 已废弃，保留以避免删字段时其它代码引用；不再读取
@@ -64,6 +64,8 @@ type SettingsView struct {
 	navMsg      string
 
 	refetchBtn widget.Clickable
+	dlAllBtn   widget.Clickable // 全量下载所有 tilemap
+	dlCancelBtn widget.Clickable // 取消全量下载
 	backBtn    widget.Clickable
 
 	confirmRefetch time.Time // 第一次点击的时间；在 3 秒内再次点击才真正触发
@@ -76,7 +78,6 @@ func NewSettingsView(a *App) *SettingsView {
 	cur := a.settings.Get()
 	v.debugChk.Value = cur.DebugLog
 	v.iconSlider.Value = iconSizeToSlider(cur.IconSize)
-	v.navSimChk.Value = cur.NavSimulator
 	v.navTrackChk.Value = cur.NavTracking
 	v.navPredictChk.Value = cur.NavPredict
 	v.autoCenter.Value = cur.NavAutoCenter
@@ -146,8 +147,6 @@ func (v *SettingsView) Layout(gtx layout.Context) layout.Dimensions {
 		spacer(6),
 		v.navPredictRow,
 		spacer(6),
-		v.navSimRow,
-		spacer(6),
 		v.autoCenterRow,
 		spacer(8),
 		v.zoomRow,
@@ -179,6 +178,8 @@ func (v *SettingsView) Layout(gtx layout.Context) layout.Dimensions {
 		v.dataPathRow,
 		spacer(8),
 		v.refetchRow,
+		spacer(8),
+		v.dlAllTilesRow,
 		spacer(24),
 	}
 
@@ -225,9 +226,6 @@ func (v *SettingsView) handleEvents(gtx layout.Context) {
 		if nv != cur.IconSize {
 			v.app.settings.Update(func(s *Settings) { s.IconSize = nv })
 		}
-	}
-	if v.navSimChk.Update(gtx) {
-		v.app.settings.Update(func(s *Settings) { s.NavSimulator = v.navSimChk.Value })
 	}
 	if v.navPredictChk.Update(gtx) {
 		v.app.settings.Update(func(s *Settings) { s.NavPredict = v.navPredictChk.Value })
@@ -345,6 +343,15 @@ func (v *SettingsView) handleEvents(gtx layout.Context) {
 	if !v.confirmRefetch.IsZero() && time.Since(v.confirmRefetch) > 3*time.Second {
 		v.confirmRefetch = time.Time{}
 		v.confirmMsg = ""
+	}
+	if v.dlAllBtn.Clicked(gtx) {
+		running, _, _, _, _, _, _, _ := v.app.TilesDLSnapshot()
+		if !running {
+			v.app.DownloadAllTilesAsync()
+		}
+	}
+	if v.dlCancelBtn.Clicked(gtx) {
+		v.app.CancelDownloadAllTiles()
 	}
 }
 
@@ -530,16 +537,67 @@ func (v *SettingsView) fieldLabel(s string) layout.Widget {
 	}
 }
 
+// dlAllTilesRow 全量下载按钮 + 进度条。running 时显示 done/total + 已写字节。
+func (v *SettingsView) dlAllTilesRow(gtx layout.Context) layout.Dimensions {
+	t := v.app.Theme
+	running, done, total, skipped, failed, bytes, finished, errMsg := v.app.TilesDLSnapshot()
+	var statusTxt string
+	switch {
+	case errMsg != "":
+		statusTxt = "错误：" + errMsg
+	case running:
+		pct := 0.0
+		if total > 0 {
+			pct = float64(done) / float64(total) * 100
+		}
+		statusTxt = fmt.Sprintf("%d / %d (%.1f%%)  已失败 %d  已写入 %.1f MB",
+			done, total, pct, failed, float64(bytes)/(1024*1024))
+	case finished:
+		statusTxt = fmt.Sprintf("完成：成功 %d / %d，失败 %d，跳过 %d，共 %.1f MB",
+			done-failed-skipped, total, failed, skipped, float64(bytes)/(1024*1024))
+	default:
+		statusTxt = "尚未开始。按父层 .png 覆盖自适应枚举 z=5..8 有效瓦片，约几万张、1~3 GB；可中途取消。"
+	}
+	btnLabel := "下载所有瓦片 (z=5..8)"
+	btnBg := t.Accent
+	if running {
+		btnLabel = "下载中…"
+		btnBg = t.Panel
+	}
+	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			b := material.Button(t.Material, &v.dlAllBtn, btnLabel)
+			b.Background = btnBg
+			b.Color = color.NRGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff}
+			b.TextSize = unit.Sp(12)
+			b.Font.Typeface = "CJK"
+			return b.Layout(gtx)
+		}),
+		layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if !running {
+				return layout.Dimensions{}
+			}
+			b := material.Button(t.Material, &v.dlCancelBtn, "取消")
+			b.Background = t.Err
+			b.Color = color.NRGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff}
+			b.TextSize = unit.Sp(12)
+			b.Font.Typeface = "CJK"
+			return b.Layout(gtx)
+		}),
+		layout.Rigid(layout.Spacer{Width: unit.Dp(12)}.Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			lbl := material.Caption(t.Material, statusTxt)
+			lbl.Color = t.TextDim
+			lbl.Font.Typeface = "CJK"
+			lbl.MaxLines = 2
+			return lbl.Layout(gtx)
+		}),
+	)
+}
+
 // 防止某些 import 在裁掉特定分支时产生未使用警告
 var _ = image.Point{}
-
-func (v *SettingsView) navSimRow(gtx layout.Context) layout.Dimensions {
-	t := v.app.Theme
-	cb := material.CheckBox(t.Material, &v.navSimChk, "使用模拟器（沿当前路径假装移动；用于无游戏环境调试视觉）")
-	cb.Color = t.Text
-	cb.Font.Typeface = "CJK"
-	return cb.Layout(gtx)
-}
 
 func (v *SettingsView) autoCenterRow(gtx layout.Context) layout.Dimensions {
 	t := v.app.Theme

@@ -24,11 +24,18 @@ type TSPNode struct {
 // SolveTSPPath 在 nodes 上求一条访问全部节点的最短开放路径。
 //   - start, end ∈ [0, len(nodes)) 表示固定端点；传 -1 表示由算法决定
 //
-// 返回访问顺序的下标序列；nodes 为空时返回 nil。
+// 返回访问顺序的下标序列；nodes 为空时返回 nil。越界的 start/end 视为 -1
+// （防御性兜底，避免上层取索引时把陈旧 / 错误的下标传进来导致越界 panic）。
 func SolveTSPPath(nodes []TSPNode, start, end int) []int {
 	n := len(nodes)
 	if n == 0 {
 		return nil
+	}
+	if start < 0 || start >= n {
+		start = -1
+	}
+	if end < 0 || end >= n {
+		end = -1
 	}
 	if n == 1 {
 		return []int{0}
@@ -134,13 +141,17 @@ func solveHeuristic(nodes []TSPNode, start, end int) []int {
 	n := len(nodes)
 	d := func(a, b int) float64 { return euclid(nodes[a], nodes[b]) }
 
-	// 预算距离矩阵（n ≤ 512 时），O(N²) 内存，换 2-opt 时 O(1) 查询
+	// 预算距离矩阵（n ≤ 512 时），O(N²) 内存，换 2-opt 时 O(1) 查询。
+	// 注意：必须先把所有 mat[i] 都分配出来，再填对称值；否则 mat[j][i] = v
+	// 在 j > i 时会写到尚未分配的 nil slice（panic: index out of range [0] with length 0）。
 	useMat := n <= 512
 	var mat [][]float64
 	if useMat {
 		mat = make([][]float64, n)
 		for i := range mat {
 			mat[i] = make([]float64, n)
+		}
+		for i := 0; i < n; i++ {
 			for j := i + 1; j < n; j++ {
 				v := euclid(nodes[i], nodes[j])
 				mat[i][j] = v
